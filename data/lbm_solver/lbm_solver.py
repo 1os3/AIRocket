@@ -4,6 +4,7 @@
 依赖: torch, data.lbm_solver.checks.lbm_solver_checks
 读取配置: grid.nx, grid.ny, solver.boundary, solver.max_steps, solver.check_interval,
           solver.conv_tol, solver.float64, solver.mrt_s
+          solver.torch_compile
 对外接口:
     - LBMSolver: 批量求解器；run_batch(masks, u_lb, tau, sdfs=None)
       -> dict(rho, ux, uy, p, mask, steps, converged)
@@ -64,6 +65,14 @@ class LBMSolver:
         self._m = m
         # 松弛率中前 7 项对整批样本相同，缓存设备张量避免每批重复分配与拷贝。
         self._mrt_s = torch.tensor(cfg.solver.mrt_s, dtype=dtype, device=device)
+        self._step_fn = self._step
+        if cfg.solver.torch_compile and hasattr(torch, "compile"):
+            try:
+                self._step_fn = torch.compile(self._step, mode="max-autotune-no-cudagraphs")
+            except Exception as exc:
+                # 编译器依赖（如 Windows 编码/本地 C++ 工具链）缺失时回退 eager，
+                # 开关不应让数据采集流程直接失败。
+                print(f"[lbm] torch.compile 不可用，回退 eager：{exc}")
         self._solid = torch.zeros(1, 1, ny, nx, dtype=torch.bool, device=device)  # run_batch 时绑定
 
     def _equilibrium(self, rho, ux, uy):
@@ -155,9 +164,17 @@ class LBMSolver:
             flat_new[:, ib].flatten().index_copy_(0, flat, torch.where(small, val_small, val_big))
         return f_new
 
+    def _step(self, f, u_lb, a, links):
+        """执行一个无收敛检查的 LBM 时间步，供 eager/compile 两条路径共用。"""
+        rho, ux, uy = self._macro(f)
+        f_col = self._collide(f, self._equilibrium(rho, ux, uy), a)
+        f_new = self._apply_bc(self._stream(f_col), u_lb)
+        return self._apply_bouzidi(f_new, f_col, links) if links is not None else f_new
+
     @torch.inference_mode()
     def run_batch(self, masks: torch.Tensor, u_lb: torch.Tensor, tau: torch.Tensor,
-                  sdfs: torch.Tensor | None = None) -> dict:
+                  sdfs: torch.Tensor | None = None,
+                  initial: dict | None = None) -> dict:
         """并行求解一批工况至各自稳态。
 
         参数:
@@ -184,7 +201,15 @@ class LBMSolver:
         active[:, :, -1] = False
         one = torch.ones(b, 1, *masks.shape[1:], dtype=self._dtype, device=self._device)
         zero = torch.zeros(b, *masks.shape[1:], dtype=self._dtype, device=self._device)
-        f = self._equilibrium(one, u_lb.view(b, 1, 1).expand_as(zero).contiguous(), zero)
+        if initial is None:
+            f = self._equilibrium(one, u_lb.view(b, 1, 1).expand_as(zero).contiguous(), zero)
+        else:
+            rho0 = initial["rho"].to(device=self._device, dtype=self._dtype)
+            ux0 = initial["ux"].to(device=self._device, dtype=self._dtype)
+            uy0 = initial["uy"].to(device=self._device, dtype=self._dtype)
+            if rho0.ndim == 3:
+                rho0 = rho0.unsqueeze(1)
+            f = self._equilibrium(rho0, ux0, uy0)
         # 碰撞矩阵批内固定，只构建一次（tau 逐样本不同 → (B,9,9)）
         s = torch.cat([self._mrt_s.expand(b, 7),
                        (1.0 / tau).unsqueeze(1).expand(b, 2)], dim=1)
@@ -197,12 +222,7 @@ class LBMSolver:
         saved_uy = torch.empty_like(saved_rho)
         prev = None
         for step in range(1, self._cfg.solver.max_steps + 1):
-            rho, ux, uy = self._macro(f)
-            f_col = self._collide(f, self._equilibrium(rho, ux, uy), a)
-            f_new = self._apply_bc(self._stream(f_col), u_lb)
-            if links is not None:
-                f_new = self._apply_bouzidi(f_new, f_col, links)
-            f = f_new
+            f = self._step_fn(f, u_lb, a, links)
             if step % self._cfg.solver.check_interval == 0:
                 rho, ux, uy = self._macro(f)
                 # 完整捕获 NaN/Inf；GPU 上 Inf 常先于 NaN 出现，漏检会白跑到 max_steps。

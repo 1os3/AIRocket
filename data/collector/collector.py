@@ -2,7 +2,8 @@
 
 模块: data/collector/collector.py
 依赖: data.airfoil, data.lbm_solver, data.sampler, data.storage
-读取配置: device, seed, grid.chord, solver.batch_size, solver.boundary, sampler.tau_min,
+读取配置: device, seed, grid.*, solver.batch_size, solver.boundary, solver.grid_sequence,
+          solver.grid_sequence_scale, solver.grid_sequence_conv_tol, sampler.tau_min,
           sampler.u_lb_max, sampler.u_lb_fixed, sampler.num_samples
 对外接口:
     - collect(cfg) -> dict（written / skipped_done / failed / total 统计）
@@ -15,6 +16,7 @@
 """
 
 import math
+from dataclasses import replace
 
 import torch
 
@@ -57,7 +59,18 @@ def _derive_lattice_params(cfg, plan) -> dict:
 
 def _run_batch(cfg, solver, writer, plans, device) -> dict:
     """跑一批样本并逐样本入库，返回本批统计。"""
-    geoms = [build_airfoil_geometry(cfg, p.naca_m, p.naca_p, p.naca_t, p.aoa_deg, device)
+    sequence = None
+    geometry_cfg = cfg
+    if cfg.solver.grid_sequence:
+        k = cfg.solver.grid_sequence_scale
+        g = cfg.grid
+        coarse_grid = replace(g, nx=g.nx // k, ny=g.ny // k, chord=max(2, g.chord // k),
+                               x_le=max(1, g.x_le // k), y_center=max(1, g.y_center // k))
+        coarse_solver_cfg = replace(cfg.solver, grid_sequence=False,
+                                    conv_tol=cfg.solver.grid_sequence_conv_tol)
+        sequence = replace(cfg, grid=coarse_grid, solver=coarse_solver_cfg)
+        geometry_cfg = sequence
+    geoms = [build_airfoil_geometry(geometry_cfg, p.naca_m, p.naca_p, p.naca_t, p.aoa_deg, device)
              for p in plans]
     masks = torch.stack([g[0] for g in geoms])
     sdfs = torch.stack([g[1] for g in geoms]) if cfg.solver.boundary == "bouzidi" else None
@@ -65,7 +78,22 @@ def _run_batch(cfg, solver, writer, plans, device) -> dict:
     dtype = torch.float64 if cfg.solver.float64 else torch.float32
     u_lb = torch.tensor([l["u_lb"] for l in lats], dtype=dtype, device=device)
     tau = torch.tensor([l["tau"] for l in lats], dtype=dtype, device=device)
-    out = solver.run_batch(masks, u_lb, tau, sdfs)
+    initial = None
+    if sequence is not None:
+        coarse_solver = LBMSolver(sequence, device)
+        coarse = coarse_solver.run_batch(masks, u_lb, tau, sdfs)
+        if all(coarse["converged"]):
+            fine_size = (cfg.grid.ny, cfg.grid.nx)
+            initial = {k: torch.nn.functional.interpolate(coarse[k].unsqueeze(1).to(device),
+                                                            size=fine_size, mode="bilinear",
+                                                            align_corners=False).squeeze(1)
+                       for k in ("rho", "ux", "uy")}
+    if sequence is not None:
+        geoms = [build_airfoil_geometry(cfg, p.naca_m, p.naca_p, p.naca_t, p.aoa_deg, device)
+                 for p in plans]
+        masks = torch.stack([g[0] for g in geoms])
+        sdfs = torch.stack([g[1] for g in geoms]) if cfg.solver.boundary == "bouzidi" else None
+    out = solver.run_batch(masks, u_lb, tau, sdfs, initial=initial)
     stats = {"written": 0, "failed": 0}
     for j, (p, lat) in enumerate(zip(plans, lats)):
         if not out["converged"][j]:

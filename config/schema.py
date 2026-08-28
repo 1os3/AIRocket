@@ -43,6 +43,10 @@ class Solver:
     conv_tol: float
     float64: bool
     mrt_s: list = field(default_factory=list)
+    grid_sequence: bool = False
+    grid_sequence_scale: int = 2
+    grid_sequence_conv_tol: float = 1.0e-5
+    torch_compile: bool = False
 
     def __post_init__(self):
         # 校验对象: solver.* —— 批大小/步数/间隔为正、容差为正、mrt_s 恰为 7 项且落在 (0,2)
@@ -51,6 +55,8 @@ class Solver:
             f"solver.boundary 仅支持 bounce_back|bouzidi，得到 {self.boundary}")
         assert self.max_steps > 0 and self.check_interval > 0, "solver 步数配置必须为正"
         assert self.conv_tol > 0, "solver.conv_tol 必须 > 0"
+        assert self.grid_sequence_scale >= 2, "solver.grid_sequence_scale 必须 >= 2"
+        assert self.grid_sequence_conv_tol > 0, "solver.grid_sequence_conv_tol 必须 > 0"
         assert len(self.mrt_s) == 7 and all(0.0 < s < 2.0 for s in self.mrt_s), (
             "solver.mrt_s 需 7 项且均在 (0,2)（Lallemand-Luo 稳定域）"
         )

@@ -42,6 +42,10 @@ solver:
   conv_tol: 1.0e-7      # 稳态判据：速度场 L2 相对变化 ‖Δu‖₂/‖u‖₂ < 此值即收敛；
                         #   不用 max 范数——壁面单点的浮点级残余振荡会卡住它（L2 鲁棒）
   float64: false        # true=双精度（高 Re 更稳、吞吐减半）；false=单精度（默认够用）
+  grid_sequence: false  # 先粗网格求解，再插值到细网格继续收敛
+  grid_sequence_scale: 2
+  grid_sequence_conv_tol: 1.0e-5
+  torch_compile: false    # 是否编译 LBM 单步；默认关闭，建议仅在 GPU 实测后启用
   # MRT 松弛率 s0..s6（矩空间依次为 ρ,e,ε,jx,qx,jy,qy 的弛豫率；
   # 剪切矩 pxx/pxy 的 s7=s8=1/tau 由粘度决定，不在此列）。
   # 取值域 (0,2)；非剪切矩偏离 1 可抑制高 Re 下的数值色散，取 Lallemand-Luo 经典值。
