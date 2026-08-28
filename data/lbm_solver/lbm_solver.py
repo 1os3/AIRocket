@@ -15,7 +15,7 @@
       （Bouzidi-Firdaouss-Lallemand 2001，按 SDF 估计的壁面分数 q 分 q<1/2 与
       q≥1/2 两式二次插值，链路掩码与 q 每批预计算一次，步内只剩逐方向 roll）。
     - MRT 碰撞折叠为批矩阵 A = M⁻¹·S·M（每样本 tau 不同 → A 形状 (B,9,9)）。
-    - 批内各样本独立判定收敛/发散；已完成样本冻结（不再更新），整批一次迭代循环。
+    - 批内各样本独立判定收敛/发散；收敛残差为内部流体节点 RMS 变化/入口速度。
     - 每步迭代无 CPU-GPU 往返；仅收敛判定周期性地取标量，最终结果一次性回传 CPU。
 """
 
@@ -234,10 +234,12 @@ class LBMSolver:
                     # 只在内部流体节点计算，去掉强制边界和固壁的舍入噪声，
                     # 使 GPU f32 的收敛判定与 CPU 一致且避免无效迭代。
                     du2 = (ux - prev[0]) ** 2 + (uy - prev[1]) ** 2
-                    u2 = ux ** 2 + uy ** 2
-                    num = du2.masked_fill(~active, 0.0).sum(dim=(1, 2)).sqrt()
-                    den = u2.masked_fill(~active, 0.0).sum(dim=(1, 2)).sqrt()
-                    hit = num / den.clamp_min(1e-12) < self._cfg.solver.conv_tol
+                    active_count = active.sum(dim=(1, 2)).clamp_min(1)
+                    # RMS 对网格节点数不敏感，并用入口速度作固定尺度，避免
+                    # 低速/回流区域的相对分母抖动导致 GPU 与 CPU 判定不一致。
+                    rms = (du2.masked_fill(~active, 0.0).sum(dim=(1, 2)) / active_count).sqrt()
+                    residual = rms / u_lb.abs().clamp_min(1e-12)
+                    hit = residual < self._cfg.solver.conv_tol
                 finished = invalid | hit
                 if not bool(finished.any()):
                     prev = (ux.clone(), uy.clone())
