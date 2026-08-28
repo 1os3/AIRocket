@@ -98,11 +98,11 @@ class Sampler:
 @dataclass(frozen=True)
 class Storage:
     path: str
-    map_size_gb: int
+    map_size_mb: int
 
     def __post_init__(self):
-        # 校验对象: storage.map_size_gb —— 必须为正
-        assert self.map_size_gb > 0, "storage.map_size_gb 必须 > 0"
+        # 校验对象: storage.map_size_mb —— 单样本子库地址空间，须为正
+        assert self.map_size_mb > 0, "storage.map_size_mb 必须 > 0"
 
 
 @dataclass(frozen=True)

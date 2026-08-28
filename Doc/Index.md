@@ -25,7 +25,7 @@
 - `data/sampler/sampler.py` — 工况参数采样器：拉丁超立方/随机采样 + 确定性种子派生
 - `data/sampler/checks/sampler_checks.py` — sampler 输出校验
 - `data/storage/__init__.py` — 存储模块重导出
-- `data/storage/storage.py` — LMDB 存储后端：稳态流场 + 参数元数据的写入与快速随机读取
+- `data/storage/storage.py` — LMDB 存储后端：一个样本一个独立子库，稳态流场 + 参数元数据的写入与随机读取
 - `data/storage/checks/storage_checks.py` — storage 入参校验
 - `data/collector/__init__.py` — 采集模块重导出
 - `data/collector/collector.py` — 采集编排：断点续采 + 分批并行求解 + 入库的端到端流程

@@ -1,4 +1,4 @@
-"""存储模块：LMDB 稳态流场写入器与随机读取 Dataset
+"""存储模块：一个样本一个 LMDB 子库的写入器与随机读取 Dataset
 
 模块: data/storage/__init__.py
 依赖: data.storage.storage
