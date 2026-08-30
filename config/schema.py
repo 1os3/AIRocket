@@ -46,6 +46,7 @@ class Solver:
     grid_sequence: bool = False
     grid_sequence_scale: int = 2
     grid_sequence_conv_tol: float = 1.0e-5
+    grid_sequence_policy: str = "auto"
     torch_compile: bool = False
     steady_hits: int = 1
     precondition_gamma: float = 1.0
@@ -65,6 +66,8 @@ class Solver:
         assert self.conv_tol > 0, "solver.conv_tol 必须 > 0"
         assert self.grid_sequence_scale >= 2, "solver.grid_sequence_scale 必须 >= 2"
         assert self.grid_sequence_conv_tol > 0, "solver.grid_sequence_conv_tol 必须 > 0"
+        assert self.grid_sequence_policy in ("auto", "always"), (
+            "solver.grid_sequence_policy 仅支持 auto|always")
         assert self.steady_hits >= 1, "solver.steady_hits 必须 >= 1"
         assert 0.0 < self.precondition_gamma <= 1.0, (
             "solver.precondition_gamma 必须在 (0,1]；1 表示关闭预条件")

@@ -1,9 +1,10 @@
 """采集编排：断点续采 + 分批并行求解 + 入库的端到端流程
 
 模块: data/collector/collector.py
-依赖: data.airfoil, data.lbm_solver, data.sampler, data.storage
+依赖: data.airfoil, data.collector.checks, data.lbm_solver, data.sampler, data.storage
 读取配置: device, seed, grid.*, solver.batch_size, solver.boundary, solver.grid_sequence,
-          solver.grid_sequence_scale, solver.grid_sequence_conv_tol, solver.initializer,
+          solver.grid_sequence_scale, solver.grid_sequence_conv_tol, solver.grid_sequence_policy,
+          solver.initializer,
           solver.potential_panels, solver.potential_blend, solver.potential_speed_limit,
           solver.sample_continuation, solver.continuation_bank_size, sampler.tau_min,
           sampler.u_lb_max, sampler.u_lb_fixed, sampler.num_samples
@@ -23,6 +24,7 @@ from dataclasses import replace
 import torch
 
 from data.airfoil import build_airfoil_geometry
+from data.collector.checks.collector_checks import check_batch_step_accounting
 from data.lbm_solver import CS2, LBMSolver
 from data.potential_initializer import build_potential_initial
 from data.sampler import plan_samples
@@ -48,14 +50,15 @@ class _ContinuationBank:
         bank = torch.stack(self._features)
         nearest = torch.cdist(features.cpu(), bank).argmin(dim=1).tolist()
         return {key: torch.stack([self._fields[i][key] for i in nearest])
-                for key in ("f", "mask")}
+                for key in ("f", "mask", "rho", "ux", "uy")}
 
     def add(self, features: torch.Tensor, out: dict) -> None:
         """仅收录严格收敛样本，失败场绝不传播给后续工况。"""
         for i, ok in enumerate(out["converged"]):
             if ok:
                 self._features.append(features[i].cpu())
-                self._fields.append({key: out[key][i] for key in ("f", "mask")})
+                self._fields.append({key: out[key][i]
+                                     for key in ("f", "mask", "rho", "ux", "uy")})
         self._features = self._features[-self._capacity:]
         self._fields = self._fields[-self._capacity:]
 
@@ -112,12 +115,49 @@ def _continuation_order(plans, features: torch.Tensor, batch_size: int) -> list:
     return anchors + [i for i in locality if i not in anchor_set]
 
 
+def _resize_macro_initial(initial: dict | None, size: tuple, device,
+                          dtype: torch.dtype) -> dict | None:
+    """把宏观场缩放到目标网格；分布函数不能直接跨网格插值。"""
+    if initial is None or not all(key in initial for key in ("rho", "ux", "uy")):
+        return None
+    rho = initial["rho"].to(device=device, dtype=dtype)
+    if rho.ndim == 3:
+        rho = rho.unsqueeze(1)
+    resized = {"rho": torch.nn.functional.interpolate(
+        rho, size=size, mode="bilinear", align_corners=False)}
+    for key in ("ux", "uy"):
+        field = initial[key].to(device=device, dtype=dtype)
+        resized[key] = torch.nn.functional.interpolate(
+            field.unsqueeze(1), size=size, mode="bilinear",
+            align_corners=False).squeeze(1)
+    return resized
+
+
+def _uniform_initial(size: tuple, u_lb: torch.Tensor) -> dict:
+    """构造均匀来流宏观场，供禁用势流或粗网格失败时逐样本回退。"""
+    b = u_lb.shape[0]
+    rho = torch.ones(b, 1, *size, dtype=u_lb.dtype, device=u_lb.device)
+    ux = u_lb.view(b, 1, 1).expand(b, *size).clone()
+    uy = torch.zeros_like(ux)
+    return {"rho": rho, "ux": ux, "uy": uy}
+
+
+def _mask_initial_velocity(initial: dict, masks: torch.Tensor) -> dict:
+    """插值会把固体内外速度混合；目标网格固体节点必须重新置零。"""
+    initial["ux"] = initial["ux"].masked_fill(masks, 0.0)
+    initial["uy"] = initial["uy"].masked_fill(masks, 0.0)
+    return initial
+
+
 def _run_batch(cfg, solver, writer, plans, device, initial=None,
-               return_state: bool = False) -> tuple:
+               return_state: bool = False, progress_offset: int = 0,
+               progress_total: int | None = None) -> tuple:
     """跑一批样本并逐样本入库，返回本批统计。"""
     sequence = None
     geometry_cfg = cfg
-    if cfg.solver.grid_sequence and initial is None:
+    use_grid_sequence = cfg.solver.grid_sequence and (
+        initial is None or cfg.solver.grid_sequence_policy == "always")
+    if use_grid_sequence:
         k = cfg.solver.grid_sequence_scale
         g = cfg.grid
         coarse_grid = replace(g, nx=g.nx // k, ny=g.ny // k, chord=max(2, g.chord // k),
@@ -135,34 +175,58 @@ def _run_batch(cfg, solver, writer, plans, device, initial=None,
     u_lb = torch.tensor([l["u_lb"] for l in lats], dtype=dtype, device=device)
     tau = torch.tensor([l["tau"] for l in lats], dtype=dtype, device=device)
     coarse_steps = [0] * len(plans)
-    if initial is None and cfg.solver.initializer == "potential":
-        initial = build_potential_initial(geometry_cfg, plans, u_lb, masks, device)
     if sequence is not None:
+        # 跨样本延续库保存的是细网格状态：先缩到粗网格，不允许它绕过网格序列。
+        coarse_initial = _resize_macro_initial(
+            initial, (sequence.grid.ny, sequence.grid.nx), device, dtype)
+        if coarse_initial is None and cfg.solver.initializer == "potential":
+            coarse_initial = build_potential_initial(
+                sequence, plans, u_lb, masks, device)
+        if coarse_initial is not None:
+            coarse_initial = _mask_initial_velocity(coarse_initial, masks)
         coarse_solver = LBMSolver(sequence, device)
-        coarse = coarse_solver.run_batch(masks, u_lb, tau, sdfs, initial=initial)
+        coarse = coarse_solver.run_batch(masks, u_lb, tau, sdfs, initial=coarse_initial)
         coarse_steps = coarse["steps"]
-        initial = None
-        if all(coarse["converged"]):
-            fine_size = (cfg.grid.ny, cfg.grid.nx)
-            initial = {k: torch.nn.functional.interpolate(coarse[k].unsqueeze(1).to(device),
-                                                            size=fine_size, mode="bilinear",
-                                                            align_corners=False).squeeze(1)
-                       for k in ("rho", "ux", "uy")}
-    if sequence is not None:
         geoms = [build_airfoil_geometry(cfg, p.naca_m, p.naca_p, p.naca_t, p.aoa_deg, device)
                  for p in plans]
         masks = torch.stack([g[0] for g in geoms])
         sdfs = torch.stack([g[1] for g in geoms]) if cfg.solver.boundary == "bouzidi" else None
-        if initial is None and cfg.solver.initializer == "potential":
-            initial = build_potential_initial(cfg, plans, u_lb, masks, device)
+        fine_size = (cfg.grid.ny, cfg.grid.nx)
+        fine_from_coarse = _resize_macro_initial(coarse, fine_size, device, dtype)
+        if all(coarse["converged"]):
+            initial = fine_from_coarse
+        else:
+            # 只让粗网格失败的样本回退；已收敛的粗解仍继续用于同批其他样本。
+            fallback = _resize_macro_initial(initial, fine_size, device, dtype)
+            if fallback is None and cfg.solver.initializer == "potential":
+                fallback = build_potential_initial(cfg, plans, u_lb, masks, device)
+            if fallback is None:
+                fallback = _uniform_initial(fine_size, u_lb)
+            coarse_ok = torch.tensor(coarse["converged"], device=device).view(-1, 1, 1)
+            initial = {
+                "rho": torch.where(coarse_ok.unsqueeze(1), fine_from_coarse["rho"],
+                                   fallback["rho"]),
+                "ux": torch.where(coarse_ok, fine_from_coarse["ux"], fallback["ux"]),
+                "uy": torch.where(coarse_ok, fine_from_coarse["uy"], fallback["uy"]),
+            }
+        initial = _mask_initial_velocity(initial, masks)
+    elif initial is None and cfg.solver.initializer == "potential":
+        initial = build_potential_initial(cfg, plans, u_lb, masks, device)
     out = solver.run_batch(masks, u_lb, tau, sdfs, initial=initial, return_state=return_state)
     out["coarse_steps"] = coarse_steps
     out["total_steps"] = [coarse_step + fine_step
                           for coarse_step, fine_step in zip(coarse_steps, out["steps"])]
+    out["grid_sequence_used"] = sequence is not None
+    check_batch_step_accounting(cfg, out, len(plans))
     stats = {"written": 0, "failed": 0}
     for j, (p, lat) in enumerate(zip(plans, lats)):
+        progress = progress_offset + j + 1
+        progress_text = f"进度 {progress}/{progress_total}，" if progress_total is not None else ""
+        route = f"粗 {out['coarse_steps'][j]} + 细 {out['steps'][j]}" \
+            if out["grid_sequence_used"] else f"粗跳过（稳态延续初值）+ 细 {out['steps'][j]}"
         if not out["converged"][j]:
-            print(f"[collector] 样本 {p.index} 未收敛/发散（{out['steps'][j]} 步），丢弃")
+            print(f"[collector] {progress_text}样本ID {p.index} 未收敛/发散"
+                  f"（{route} 步），丢弃")
             stats["failed"] += 1
             continue
         fields = {k: out[k][j] for k in ("rho", "ux", "uy", "p", "mask")}
@@ -170,8 +234,8 @@ def _run_batch(cfg, solver, writer, plans, device, initial=None,
                                  "coarse_steps": out["coarse_steps"][j],
                                  "fine_steps": out["steps"][j],
                                  "converged": True, "chord": cfg.grid.chord})
-        print(f"[collector] 样本 {p.index} 收敛于 {out['total_steps'][j]} 步"
-              f"（粗 {out['coarse_steps'][j]} + 细 {out['steps'][j]}），已写入")
+        print(f"[collector] {progress_text}样本ID {p.index} 收敛于 {out['total_steps'][j]} 步"
+              f"（{route}），已写入")
         stats["written"] += 1
     return stats, out
 
@@ -193,6 +257,13 @@ def collect(cfg) -> dict:
     assert not (pending_seeds & writer.existing_seeds()), (
         "待采样本种子与库内重复：配置（seed/num_samples/method/区间）已被改动，请用新库")
     print(f"[collector] device={device} 计划 {len(plans)} 样本，已完成 {len(done)}，待采 {len(todo)}")
+    if all_features is not None and todo:
+        print("[collector] 已按工况邻近性重排待采顺序；样本ID仍是采样表中的稳定编号，"
+              "因此日志中的ID不会连续")
+    if cfg.solver.grid_sequence:
+        policy = "有稳态延续时跳过粗网格" \
+            if cfg.solver.grid_sequence_policy == "auto" else "每批强制执行粗网格"
+        print(f"[collector] 粗细网格策略={cfg.solver.grid_sequence_policy}（{policy}）")
     writer.write_meta()
     solver = LBMSolver(cfg, device)
     stats = {"written": 0, "skipped_done": len(done), "failed": 0}
@@ -205,7 +276,8 @@ def collect(cfg) -> dict:
             if all_features is not None else None
         initial = bank.initial(features) if bank is not None else None
         batch_stats, out = _run_batch(
-            cfg, solver, writer, batch, device, initial, return_state=bank is not None)
+            cfg, solver, writer, batch, device, initial, return_state=bank is not None,
+            progress_offset=i, progress_total=len(todo))
         if bank is not None:
             bank.add(features, out)
         stats["written"] += batch_stats["written"]

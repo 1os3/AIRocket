@@ -33,6 +33,8 @@
 - `data/storage/checks/storage_checks.py` — storage 入参校验
 - `data/collector/__init__.py` — 采集模块重导出
 - `data/collector/collector.py` — 采集编排：断点续采 + 分批并行求解 + 入库的端到端流程
+- `data/collector/checks/__init__.py` — 采集编排校验重导出
+- `data/collector/checks/collector_checks.py` — 校验批次粗细网格步数记录与启用语义
 - `data/run.py` — CLI 入口：2D 流场仿真数据集端到端生成（留在 data 包根）
 
 ## vis
