@@ -5,6 +5,7 @@
 读取配置: grid.nx, grid.ny, grid.chord, grid.x_le, grid.y_center, airfoil.n_points
 对外接口:
     - naca4_polygon(m, p, t, n_points, device) -> (K, 2) 张量
+    - build_airfoil_polygon(cfg, m, p, t, aoa_deg, device) -> (K, 2) 张量
     - build_airfoil_geometry(cfg, m, p, t, aoa_deg, device) -> (mask, sdf)
     - build_airfoil_mask(cfg, m, p, t, aoa_deg, device) -> (ny, nx) bool 张量
 说明: 栅格化用 torch 向量化的射线法（even-odd 规则），全程在目标设备上计算，
@@ -18,7 +19,7 @@ import torch
 
 from data.airfoil.checks.airfoil_checks import check_naca_params
 
-__all__ = ["naca4_polygon", "build_airfoil_geometry", "build_airfoil_mask"]
+__all__ = ["naca4_polygon", "build_airfoil_polygon", "build_airfoil_geometry", "build_airfoil_mask"]
 
 
 def naca4_polygon(m: float, p: float, t: float, n_points: int, device) -> torch.Tensor:
@@ -51,6 +52,12 @@ def _rotate(points: torch.Tensor, aoa_deg: float) -> torch.Tensor:
     center = torch.tensor([0.25, 0.0], device=points.device)
     rot = torch.tensor([[c, -s], [s, c]], device=points.device)
     return (points - center) @ rot.T + center
+
+
+def build_airfoil_polygon(cfg, m: float, p: float, t: float,
+                          aoa_deg: float, device) -> torch.Tensor:
+    """生成旋转后的弦长归一翼型多边形，供栅格化和面元初始化共用。"""
+    return _rotate(naca4_polygon(m, p, t, cfg.airfoil.n_points, device), aoa_deg)
 
 
 def _points_in_polygon(xs: torch.Tensor, ys: torch.Tensor, poly: torch.Tensor) -> torch.Tensor:
@@ -100,7 +107,7 @@ def build_airfoil_geometry(cfg, m: float, p: float, t: float, aoa_deg: float, de
         供 Bouzidi 插值反弹估计壁面分数 q
     """
     g = cfg.grid
-    poly = _rotate(naca4_polygon(m, p, t, cfg.airfoil.n_points, device), aoa_deg)
+    poly = build_airfoil_polygon(cfg, m, p, t, aoa_deg, device)
     # 网格物理坐标（弦长归一）：翼型前缘置于 (x_le, y_center)，y 轴向上为正
     xs = (torch.arange(g.nx, device=device, dtype=poly.dtype) + 0.5 - g.x_le) / g.chord
     ys = (torch.arange(g.ny, device=device, dtype=poly.dtype) + 0.5 - g.y_center) / g.chord

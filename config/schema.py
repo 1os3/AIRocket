@@ -47,6 +47,14 @@ class Solver:
     grid_sequence_scale: int = 2
     grid_sequence_conv_tol: float = 1.0e-5
     torch_compile: bool = False
+    steady_hits: int = 1
+    precondition_gamma: float = 1.0
+    initializer: str = "uniform"
+    potential_panels: int = 64
+    potential_blend: float = 0.5
+    potential_speed_limit: float = 1.5
+    sample_continuation: bool = False
+    continuation_bank_size: int = 64
 
     def __post_init__(self):
         # 校验对象: solver.* —— 批大小/步数/间隔为正、容差为正、mrt_s 恰为 7 项且落在 (0,2)
@@ -57,6 +65,19 @@ class Solver:
         assert self.conv_tol > 0, "solver.conv_tol 必须 > 0"
         assert self.grid_sequence_scale >= 2, "solver.grid_sequence_scale 必须 >= 2"
         assert self.grid_sequence_conv_tol > 0, "solver.grid_sequence_conv_tol 必须 > 0"
+        assert self.steady_hits >= 1, "solver.steady_hits 必须 >= 1"
+        assert 0.0 < self.precondition_gamma <= 1.0, (
+            "solver.precondition_gamma 必须在 (0,1]；1 表示关闭预条件")
+        assert self.initializer in ("uniform", "potential"), (
+            "solver.initializer 仅支持 uniform|potential")
+        assert self.potential_panels >= 16 and self.potential_panels % 2 == 0, (
+            "solver.potential_panels 必须是 >=16 的偶数")
+        assert 0.0 <= self.potential_blend <= 1.0, (
+            "solver.potential_blend 必须在 [0,1]")
+        assert self.potential_speed_limit >= 1.0, (
+            "solver.potential_speed_limit 必须 >= 1")
+        assert self.continuation_bank_size >= 1, (
+            "solver.continuation_bank_size 必须 >= 1")
         assert len(self.mrt_s) == 7 and all(0.0 < s < 2.0 for s in self.mrt_s), (
             "solver.mrt_s 需 7 项且均在 (0,2)（Lallemand-Luo 稳定域）"
         )

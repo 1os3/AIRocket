@@ -5,10 +5,16 @@
 读取配置: 无（见 airfoil.py 文件头）
 对外接口:
     - naca4_polygon(m, p, t, n_points, device) -> (K, 2) 张量
+    - build_airfoil_polygon(cfg, m, p, t, aoa_deg, device) -> (K, 2) 张量
     - build_airfoil_geometry(cfg, m, p, t, aoa_deg, device) -> (mask, sdf)
     - build_airfoil_mask(cfg, m, p, t, aoa_deg, device) -> (ny, nx) bool 张量
 """
 
-from data.airfoil.airfoil import build_airfoil_geometry, build_airfoil_mask, naca4_polygon
+from data.airfoil.airfoil import (
+    build_airfoil_geometry,
+    build_airfoil_mask,
+    build_airfoil_polygon,
+    naca4_polygon,
+)
 
-__all__ = ["naca4_polygon", "build_airfoil_geometry", "build_airfoil_mask"]
+__all__ = ["naca4_polygon", "build_airfoil_polygon", "build_airfoil_geometry", "build_airfoil_mask"]

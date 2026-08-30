@@ -4,6 +4,7 @@
 
 - `Doc/开发规范.md` — 项目强制开发约定（配置外置、校验下沉、文件头、中文注释）
 - `Doc/Index.md` — 本索引，全项目文档与源文件单一导航入口
+- `Doc/稳态加速.md` — 严格稳态采集的算法、基准、误差与后续加速路线
 
 ## config
 
@@ -21,6 +22,9 @@
 - `data/airfoil/__init__.py` — 翼型模块重导出
 - `data/airfoil/airfoil.py` — 参数化翼型生成与 GPU 栅格化：NACA 四位数族 → 反弹边界掩码与有符号距离场
 - `data/airfoil/checks/airfoil_checks.py` — airfoil 入参校验
+- `data/potential_initializer/__init__.py` — 无粘源面元初值模块重导出
+- `data/potential_initializer/potential_initializer.py` — 无粘源面元近似：为黏性 LBM 构造满足翼面不穿透的初始速度场
+- `data/potential_initializer/checks/potential_initializer_checks.py` — potential_initializer 入参校验
 - `data/sampler/__init__.py` — 采样模块重导出
 - `data/sampler/sampler.py` — 工况参数采样器：拉丁超立方/随机采样 + 确定性种子派生
 - `data/sampler/checks/sampler_checks.py` — sampler 输出校验

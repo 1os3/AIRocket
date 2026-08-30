@@ -4,9 +4,9 @@
 依赖: torch, data.lbm_solver.checks.lbm_solver_checks
 读取配置: grid.nx, grid.ny, solver.boundary, solver.max_steps, solver.check_interval,
           solver.conv_tol, solver.float64, solver.mrt_s
-          solver.torch_compile
+          solver.torch_compile, solver.steady_hits, solver.precondition_gamma
 对外接口:
-    - LBMSolver: 批量求解器；run_batch(masks, u_lb, tau, sdfs=None)
+    - LBMSolver: 批量求解器；run_batch(masks, u_lb, tau, sdfs=None, initial=None, return_state=False)
       -> dict(rho, ux, uy, p, mask, steps, converged)
 说明:
     - 分布函数 f 形状 (B, 9, H, W)：dim0 批样本、dim1 离散速度方向、dim2=y、dim3=x。
@@ -56,6 +56,7 @@ class LBMSolver:
         self._device = device
         dtype = torch.float64 if cfg.solver.float64 else torch.float32
         self._dtype = dtype
+        self._gamma = cfg.solver.precondition_gamma
         ny, nx = cfg.grid.ny, cfg.grid.nx
         self._ex = torch.tensor(_EX, dtype=dtype, device=device).view(1, 9, 1, 1)
         self._ey = torch.tensor(_EY, dtype=dtype, device=device).view(1, 9, 1, 1)
@@ -79,7 +80,7 @@ class LBMSolver:
         """平衡分布：rho (B,1,H,W)，ux/uy (B,H,W) → feq (B,9,H,W)。"""
         eu = self._ex * ux.unsqueeze(1) + self._ey * uy.unsqueeze(1)
         u2 = (ux * ux + uy * uy).unsqueeze(1)
-        return self._w * rho * (1.0 + 3.0 * eu + 4.5 * eu * eu - 1.5 * u2)
+        return self._w * rho * (1.0 + 3.0 * eu + (4.5 * eu * eu - 1.5 * u2) / self._gamma)
 
     def _collide(self, f, feq, a):
         """MRT 碰撞：f* = f − A·(f − feq)，A (B,9,9) 由 run_batch() 一次性构建。"""
@@ -174,7 +175,8 @@ class LBMSolver:
     @torch.inference_mode()
     def run_batch(self, masks: torch.Tensor, u_lb: torch.Tensor, tau: torch.Tensor,
                   sdfs: torch.Tensor | None = None,
-                  initial: dict | None = None) -> dict:
+                  initial: dict | None = None,
+                  return_state: bool = False) -> dict:
         """并行求解一批工况至各自稳态。
 
         参数:
@@ -203,6 +205,13 @@ class LBMSolver:
         zero = torch.zeros(b, *masks.shape[1:], dtype=self._dtype, device=self._device)
         if initial is None:
             f = self._equilibrium(one, u_lb.view(b, 1, 1).expand_as(zero).contiguous(), zero)
+        elif "f" in initial:
+            f = initial["f"].to(device=self._device, dtype=self._dtype)
+            if "mask" in initial:
+                changed = initial["mask"].to(self._device) != original_masks
+                fallback = self._equilibrium(
+                    one, u_lb.view(b, 1, 1).expand_as(zero).contiguous(), zero)
+                f = torch.where(changed.unsqueeze(1), fallback, f)
         else:
             rho0 = initial["rho"].to(device=self._device, dtype=self._dtype)
             ux0 = initial["ux"].to(device=self._device, dtype=self._dtype)
@@ -211,15 +220,21 @@ class LBMSolver:
                 rho0 = rho0.unsqueeze(1)
             f = self._equilibrium(rho0, ux0, uy0)
         # 碰撞矩阵批内固定，只构建一次（tau 逐样本不同 → (B,9,9)）
+        # 预条件只改变伪时间特征速度；按 ν=γ·cs²·(tau_p-1/2) 换算剪切松弛，
+        # 保持目标稳态 Navier-Stokes 方程的物理黏度不变。
+        tau_p = 0.5 + (tau - 0.5) / self._gamma
         s = torch.cat([self._mrt_s.expand(b, 7),
-                       (1.0 / tau).unsqueeze(1).expand(b, 2)], dim=1)
+                       (1.0 / tau_p).unsqueeze(1).expand(b, 2)], dim=1)
         a = self._m_inv.unsqueeze(0) @ torch.diag_embed(s) @ self._m.unsqueeze(0)
         original = torch.arange(total, device=self._device)
         steps = torch.zeros(total, dtype=torch.long, device=self._device)
         converged = torch.zeros(total, dtype=torch.bool, device=self._device)
+        hit_streak = torch.zeros(b, dtype=torch.long, device=self._device)
         saved_rho = torch.empty(total, *masks.shape[1:], dtype=self._dtype, device=self._device)
         saved_ux = torch.empty_like(saved_rho)
         saved_uy = torch.empty_like(saved_rho)
+        saved_f = torch.empty(total, 9, *masks.shape[1:], dtype=self._dtype, device=self._device) \
+            if return_state else None
         prev = None
         for step in range(1, self._cfg.solver.max_steps + 1):
             f = self._step_fn(f, u_lb, a, links)
@@ -240,7 +255,9 @@ class LBMSolver:
                     rms = (du2.masked_fill(~active, 0.0).sum(dim=(1, 2)) / active_count).sqrt()
                     residual = rms / u_lb.abs().clamp_min(1e-12)
                     hit = residual < self._cfg.solver.conv_tol
-                finished = invalid | hit
+                    hit_streak = torch.where(hit, hit_streak + 1, torch.zeros_like(hit_streak))
+                steady = hit_streak >= self._cfg.solver.steady_hits
+                finished = invalid | steady
                 if not bool(finished.any()):
                     prev = (ux.clone(), uy.clone())
                     continue
@@ -248,8 +265,10 @@ class LBMSolver:
                 saved_rho[completed] = rho.squeeze(1)[finished]
                 saved_ux[completed] = ux[finished]
                 saved_uy[completed] = uy[finished]
+                if saved_f is not None:
+                    saved_f[completed] = f[finished]
                 steps[completed] = step
-                converged[completed] = hit[finished]
+                converged[completed] = steady[finished]
                 keep = ~finished
                 if not bool(keep.any()):
                     original = original[:0]
@@ -257,6 +276,7 @@ class LBMSolver:
                 # 收敛样本真正移出批次；后续碰撞、迁移和边界处理只计算未完成样本。
                 original = original[keep]
                 f, u_lb, a = f[keep], u_lb[keep], a[keep]
+                hit_streak = hit_streak[keep]
                 self._solid = self._solid[keep]
                 sdfs_active = sdfs_active[keep] if sdfs_active is not None else None
                 b = original.numel()
@@ -272,10 +292,20 @@ class LBMSolver:
             saved_rho[original] = rho.squeeze(1)
             saved_ux[original] = ux
             saved_uy[original] = uy
+            if saved_f is not None:
+                saved_f[original] = f
             steps[original] = step
-        # 仅在批结束时一次性回传 CPU；压力取 p = cs²·(ρ − 1)（去静压）
+        # 仅在批结束时一次性回传 CPU；不可压压力按流体域零均值固定任意常数规约。
+        pressure = (saved_rho - 1.0) * (_CS2 * self._gamma)
+        fluid = ~original_masks
+        pressure_mean = pressure.masked_fill(~fluid, 0.0).sum(dim=(1, 2)) \
+            / fluid.sum(dim=(1, 2)).clamp_min(1)
+        pressure = pressure - pressure_mean.view(-1, 1, 1)
         fields = {k: v.detach().to("cpu", torch.float32)
                   for k, v in {"rho": saved_rho, "ux": saved_ux, "uy": saved_uy,
-                               "p": (saved_rho - 1.0) * _CS2}.items()}
-        return {**fields, "mask": original_masks.cpu(),
-                "steps": steps.tolist(), "converged": converged.tolist()}
+                               "p": pressure}.items()}
+        result = {**fields, "mask": original_masks.cpu(),
+                  "steps": steps.tolist(), "converged": converged.tolist()}
+        if saved_f is not None:
+            result["f"] = saved_f.detach().to("cpu", torch.float32)
+        return result

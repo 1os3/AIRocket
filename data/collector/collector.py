@@ -3,7 +3,9 @@
 模块: data/collector/collector.py
 依赖: data.airfoil, data.lbm_solver, data.sampler, data.storage
 读取配置: device, seed, grid.*, solver.batch_size, solver.boundary, solver.grid_sequence,
-          solver.grid_sequence_scale, solver.grid_sequence_conv_tol, sampler.tau_min,
+          solver.grid_sequence_scale, solver.grid_sequence_conv_tol, solver.initializer,
+          solver.potential_panels, solver.potential_blend, solver.potential_speed_limit,
+          solver.sample_continuation, solver.continuation_bank_size, sampler.tau_min,
           sampler.u_lb_max, sampler.u_lb_fixed, sampler.num_samples
 对外接口:
     - collect(cfg) -> dict（written / skipped_done / failed / total 统计）
@@ -22,12 +24,40 @@ import torch
 
 from data.airfoil import build_airfoil_geometry
 from data.lbm_solver import CS2, LBMSolver
+from data.potential_initializer import build_potential_initial
 from data.sampler import plan_samples
 from data.storage import FlowFieldWriter
 
 __all__ = ["collect"]
 
 _CS = math.sqrt(CS2)
+
+
+class _ContinuationBank:
+    """在 CPU 保留近期稳态场，并为下一批选择有效参数空间中的最近初值。"""
+
+    def __init__(self, capacity: int):
+        self._capacity = capacity
+        self._features = []
+        self._fields = []
+
+    def initial(self, features: torch.Tensor) -> dict | None:
+        """按欧氏距离为每个目标选最近场；空库返回 None 以触发势流冷启动。"""
+        if not self._features:
+            return None
+        bank = torch.stack(self._features)
+        nearest = torch.cdist(features.cpu(), bank).argmin(dim=1).tolist()
+        return {key: torch.stack([self._fields[i][key] for i in nearest])
+                for key in ("f", "mask")}
+
+    def add(self, features: torch.Tensor, out: dict) -> None:
+        """仅收录严格收敛样本，失败场绝不传播给后续工况。"""
+        for i, ok in enumerate(out["converged"]):
+            if ok:
+                self._features.append(features[i].cpu())
+                self._fields.append({key: out[key][i] for key in ("f", "mask")})
+        self._features = self._features[-self._capacity:]
+        self._fields = self._fields[-self._capacity:]
 
 
 def _resolve_device(name: str) -> torch.device:
@@ -57,11 +87,37 @@ def _derive_lattice_params(cfg, plan) -> dict:
             "reynolds_lattice": u * chord / nu, "mach_lattice": u / _CS}
 
 
-def _run_batch(cfg, solver, writer, plans, device) -> dict:
+def _plan_features(cfg, plans) -> torch.Tensor:
+    """构造真正影响求解的归一化特征，避免被截断前的目标 Re/Ma 误导近邻选择。"""
+    lats = [_derive_lattice_params(cfg, plan) for plan in plans]
+    values = torch.tensor([
+        [lat["u_lb"], lat["tau"], plan.aoa_deg, plan.naca_m, plan.naca_p, plan.naca_t]
+        for plan, lat in zip(plans, lats)], dtype=torch.float64)
+    lower, upper = values.amin(dim=0), values.amax(dim=0)
+    return (values - lower) / (upper - lower).clamp_min(torch.finfo(values.dtype).eps)
+
+
+def _continuation_order(plans, features: torch.Tensor, batch_size: int) -> list:
+    """Morton 局部排序；首批优先高黏度/低攻角样本，为延续库建立可靠锚点。"""
+    quantized = (features.clamp(0.0, 1.0) * 1023).round().to(torch.long)
+    codes = torch.zeros(len(plans), dtype=torch.long)
+    for bit in range(10):
+        for dim in range(features.shape[1]):
+            codes |= ((quantized[:, dim] >> bit) & 1) << (bit * features.shape[1] + dim)
+    locality = torch.argsort(codes, stable=True).tolist()
+    easy = sorted(range(len(plans)),
+                  key=lambda i: (-features[i, 1].item(), abs(plans[i].aoa_deg), plans[i].naca_m))
+    anchors = easy[:min(batch_size, len(plans))]
+    anchor_set = set(anchors)
+    return anchors + [i for i in locality if i not in anchor_set]
+
+
+def _run_batch(cfg, solver, writer, plans, device, initial=None,
+               return_state: bool = False) -> tuple:
     """跑一批样本并逐样本入库，返回本批统计。"""
     sequence = None
     geometry_cfg = cfg
-    if cfg.solver.grid_sequence:
+    if cfg.solver.grid_sequence and initial is None:
         k = cfg.solver.grid_sequence_scale
         g = cfg.grid
         coarse_grid = replace(g, nx=g.nx // k, ny=g.ny // k, chord=max(2, g.chord // k),
@@ -78,10 +134,14 @@ def _run_batch(cfg, solver, writer, plans, device) -> dict:
     dtype = torch.float64 if cfg.solver.float64 else torch.float32
     u_lb = torch.tensor([l["u_lb"] for l in lats], dtype=dtype, device=device)
     tau = torch.tensor([l["tau"] for l in lats], dtype=dtype, device=device)
-    initial = None
+    coarse_steps = [0] * len(plans)
+    if initial is None and cfg.solver.initializer == "potential":
+        initial = build_potential_initial(geometry_cfg, plans, u_lb, masks, device)
     if sequence is not None:
         coarse_solver = LBMSolver(sequence, device)
-        coarse = coarse_solver.run_batch(masks, u_lb, tau, sdfs)
+        coarse = coarse_solver.run_batch(masks, u_lb, tau, sdfs, initial=initial)
+        coarse_steps = coarse["steps"]
+        initial = None
         if all(coarse["converged"]):
             fine_size = (cfg.grid.ny, cfg.grid.nx)
             initial = {k: torch.nn.functional.interpolate(coarse[k].unsqueeze(1).to(device),
@@ -93,7 +153,12 @@ def _run_batch(cfg, solver, writer, plans, device) -> dict:
                  for p in plans]
         masks = torch.stack([g[0] for g in geoms])
         sdfs = torch.stack([g[1] for g in geoms]) if cfg.solver.boundary == "bouzidi" else None
-    out = solver.run_batch(masks, u_lb, tau, sdfs, initial=initial)
+        if initial is None and cfg.solver.initializer == "potential":
+            initial = build_potential_initial(cfg, plans, u_lb, masks, device)
+    out = solver.run_batch(masks, u_lb, tau, sdfs, initial=initial, return_state=return_state)
+    out["coarse_steps"] = coarse_steps
+    out["total_steps"] = [coarse_step + fine_step
+                          for coarse_step, fine_step in zip(coarse_steps, out["steps"])]
     stats = {"written": 0, "failed": 0}
     for j, (p, lat) in enumerate(zip(plans, lats)):
         if not out["converged"][j]:
@@ -101,11 +166,14 @@ def _run_batch(cfg, solver, writer, plans, device) -> dict:
             stats["failed"] += 1
             continue
         fields = {k: out[k][j] for k in ("rho", "ux", "uy", "p", "mask")}
-        writer.write(p, fields, {**lat, "steps": out["steps"][j],
+        writer.write(p, fields, {**lat, "steps": out["total_steps"][j],
+                                 "coarse_steps": out["coarse_steps"][j],
+                                 "fine_steps": out["steps"][j],
                                  "converged": True, "chord": cfg.grid.chord})
-        print(f"[collector] 样本 {p.index} 收敛于 {out['steps'][j]} 步，已写入")
+        print(f"[collector] 样本 {p.index} 收敛于 {out['total_steps'][j]} 步"
+              f"（粗 {out['coarse_steps'][j]} + 细 {out['steps'][j]}），已写入")
         stats["written"] += 1
-    return stats
+    return stats, out
 
 
 def collect(cfg) -> dict:
@@ -115,6 +183,11 @@ def collect(cfg) -> dict:
     plans = plan_samples(cfg)
     done = writer.existing_indices()
     todo = [p for p in plans if p.index not in done]
+    all_features = _plan_features(cfg, plans) if cfg.solver.sample_continuation else None
+    if all_features is not None and todo:
+        todo_features = all_features[torch.tensor([p.index for p in todo])]
+        order = _continuation_order(todo, todo_features, cfg.solver.batch_size)
+        todo = [todo[i] for i in order]
     pending_seeds = {p.seed for p in todo}
     # 校验对象: 续采种子安全 —— 待采样本的派生种子不得与库内已有种子重复
     assert not (pending_seeds & writer.existing_seeds()), (
@@ -124,8 +197,17 @@ def collect(cfg) -> dict:
     solver = LBMSolver(cfg, device)
     stats = {"written": 0, "skipped_done": len(done), "failed": 0}
     bs = cfg.solver.batch_size
+    bank = _ContinuationBank(cfg.solver.continuation_bank_size) \
+        if cfg.solver.sample_continuation else None
     for i in range(0, len(todo), bs):
-        batch_stats = _run_batch(cfg, solver, writer, todo[i:i + bs], device)
+        batch = todo[i:i + bs]
+        features = all_features[torch.tensor([p.index for p in batch])] \
+            if all_features is not None else None
+        initial = bank.initial(features) if bank is not None else None
+        batch_stats, out = _run_batch(
+            cfg, solver, writer, batch, device, initial, return_state=bank is not None)
+        if bank is not None:
+            bank.add(features, out)
         stats["written"] += batch_stats["written"]
         stats["failed"] += batch_stats["failed"]
     writer.close()
