@@ -5,13 +5,14 @@
 - `Doc/开发规范.md` — 项目强制开发约定（配置外置、校验下沉、文件头、中文注释）
 - `Doc/Index.md` — 本索引，全项目文档与源文件单一导航入口
 - `Doc/稳态加速.md` — 严格稳态采集的算法、基准、误差与后续加速路线
+- `Doc/模型训练.md` — 流场残差 Transformer、训练缓存、物理损失与精度边界说明
 
 ## config
 
 - `config/__init__.py` — 配置加载入口：读 yaml → 合并环境覆盖 → 构造 Config
-- `config/default.yaml` — 数据集生成全部可调参数（唯一数据来源）
+- `config/default.yaml` — 数据生成、模型与训练全部可调参数（唯一数据来源）
 - `config/schema.py` — 配置类型定义与加载期校验（配置约束的单一来源）
-- `config/smoke.yaml` — 冒烟环境覆盖：小网格少步数，CPU 开发平台端到端验证用
+- `config/train_smoke.yaml` — 正式模型结构的 CPU 最小冒烟与单样本过拟合覆盖
 
 ## data
 
@@ -36,6 +37,27 @@
 - `data/collector/checks/__init__.py` — 采集编排校验重导出
 - `data/collector/checks/collector_checks.py` — 校验批次粗细网格步数记录与启用语义
 - `data/run.py` — CLI 入口：2D 流场仿真数据集端到端生成（留在 data 包根）
+- `data/training_cache/__init__.py` — 训练缓存模块重导出
+- `data/training_cache/training_cache.py` — 原始 LMDB 到独立训练缓存的精确几何与残差预处理
+- `data/training_cache/checks/training_cache_checks.py` — 训练缓存源样本校验
+
+## model
+
+- `model/__init__.py` — 模型包声明，公开流场残差 Transformer
+- `model/flow_transformer/__init__.py` — 流场残差 Transformer 模块重导出
+- `model/flow_transformer/flow_transformer.py` — 12 层静态注意力残差 Transformer 与三级 FP32 PixelShuffle 解码器
+- `model/flow_transformer/checks/flow_transformer_checks.py` — 流场残差 Transformer 输入校验
+
+## train
+
+- `train/__init__.py` — 训练包声明
+- `train/run.py` — CLI 入口：准备缓存、训练、评估与 CPU 最小冒烟
+- `train/losses/__init__.py` — 流场损失模块重导出
+- `train/losses/losses.py` — 监督、稳态 Navier–Stokes 与精确边界物理损失
+- `train/losses/checks/losses_checks.py` — 流场损失输入校验
+- `train/engine/__init__.py` — 训练引擎模块重导出
+- `train/engine/engine.py` — 单卡训练、评估、断点恢复与 CPU 最小过拟合验收
+- `train/engine/checks/engine_checks.py` — 训练数据划分非空校验
 
 ## vis
 

@@ -4,7 +4,9 @@
 依赖: 标准库 dataclasses
 读取配置: 全部（本文件定义其类型与约束）
 对外接口:
-    - Grid / Solver / Airfoil / Sampler / Storage / Config: 配置 dataclass
+    - Grid / Solver / Airfoil / Sampler / Storage / Vis: 数据生成配置 dataclass
+    - TrainingData / Model / Training / Loss / Evaluation: 模型训练配置 dataclass
+    - Config / config_from_dict(raw): 完整配置及构造入口
     - config_from_dict(raw: dict) -> Config
 说明: 约束校验只写在这里（规范 §7.1 唯一例外），运行期 _checks.py 不重复。
 """
@@ -89,10 +91,13 @@ class Solver:
 @dataclass(frozen=True)
 class Airfoil:
     n_points: int
+    sdf_chunk_cpu: int
+    sdf_chunk_cuda: int
 
     def __post_init__(self):
         # 校验对象: airfoil.n_points —— 至少 8 点才能勾勒厚度分布
         assert self.n_points >= 8, "airfoil.n_points 必须 >= 8"
+        assert self.sdf_chunk_cpu > 0 and self.sdf_chunk_cuda > 0, "SDF 分块必须 > 0"
 
 
 @dataclass(frozen=True)
@@ -129,10 +134,12 @@ class Sampler:
 class Storage:
     path: str
     map_size_mb: int
+    reader_cache_size: int
 
     def __post_init__(self):
         # 校验对象: storage.map_size_mb —— 单样本子库地址空间，须为正
         assert self.map_size_mb > 0, "storage.map_size_mb 必须 > 0"
+        assert self.reader_cache_size >= 0, "storage.reader_cache_size 必须 >= 0"
 
 
 @dataclass(frozen=True)
@@ -153,6 +160,115 @@ class Vis:
 
 
 @dataclass(frozen=True)
+class TrainingData:
+    cache_path: str
+    split: list
+    split_seed: int
+    compression_level: int
+    prepare_batch_size: int
+    prepare_cpu_threads: int
+
+    def __post_init__(self):
+        # 校验对象: training_data.* —— 划分覆盖全集，压缩级别与准备批量合法
+        assert len(self.split) == 3 and all(0.0 <= x <= 1.0 for x in self.split), (
+            "training_data.split 必须为三个 [0,1] 比例")
+        assert abs(sum(self.split) - 1.0) < 1.0e-8, "training_data.split 之和必须为 1"
+        assert 0 <= self.compression_level <= 9, "compression_level 必须在 [0,9]"
+        assert self.prepare_batch_size > 0, "prepare_batch_size 必须 > 0"
+        assert self.prepare_cpu_threads > 0, "prepare_cpu_threads 必须 > 0"
+
+
+@dataclass(frozen=True)
+class Model:
+    input_channels: int
+    output_channels: int
+    patch_size: int
+    dim: int
+    depth: int
+    heads: int
+    ffn_hidden: int
+    decoder_channels: list
+    norm_eps: float
+    dropout: float
+
+    def __post_init__(self):
+        # 校验对象: model.* —— 注意力、SwiGLU 与三级像素洗牌的维度必须可整除
+        assert self.input_channels > 0 and self.output_channels > 0, "模型通道数必须 > 0"
+        assert self.patch_size > 0 and self.dim > 0 and self.depth > 0, "模型尺寸必须 > 0"
+        assert self.dim % self.heads == 0, "model.dim 必须能被 heads 整除"
+        assert self.dim % 4 == 0, "二维正余弦位置编码要求 model.dim 能被 4 整除"
+        assert self.ffn_hidden % 2 == 0, "SwiGLU 要求 ffn_hidden 为偶数"
+        assert len(self.decoder_channels) == 3 and all(x > 0 for x in self.decoder_channels), (
+            "decoder_channels 必须是三个正整数")
+        assert self.norm_eps > 0.0 and 0.0 <= self.dropout < 1.0, "Norm/dropout 配置非法"
+
+
+@dataclass(frozen=True)
+class Training:
+    epochs: int
+    batch_size: int
+    gradient_accumulation: int
+    num_workers: int
+    lr: float
+    min_lr: float
+    beta1: float
+    beta2: float
+    weight_decay: float
+    warmup_ratio: float
+    grad_clip: float
+    amp_dtype: str
+    torch_compile: bool
+    output_dir: str
+    checkpoint_every: int
+    log_every: int
+    max_steps: int | None
+    smoke_min_improvement: float
+
+    def __post_init__(self):
+        # 校验对象: training.* —— 优化器、精度与循环参数必须处于有效范围
+        assert self.epochs > 0 and self.batch_size > 0 and self.gradient_accumulation > 0, (
+            "训练轮数、批量和梯度累积必须 > 0")
+        assert self.num_workers >= 0 and self.lr > 0.0 and 0.0 <= self.min_lr <= self.lr, (
+            "训练 worker/学习率配置非法")
+        assert 0.0 < self.beta1 < 1.0 and 0.0 < self.beta2 < 1.0, "AdamW beta 必须在 (0,1)"
+        assert self.weight_decay >= 0.0 and 0.0 <= self.warmup_ratio < 1.0, (
+            "weight_decay/warmup_ratio 配置非法")
+        assert self.grad_clip > 0.0 and self.amp_dtype in ("auto", "bfloat16", "float16"), (
+            "grad_clip/amp_dtype 配置非法")
+        assert self.checkpoint_every > 0 and self.log_every > 0, "保存与日志间隔必须 > 0"
+        assert self.max_steps is None or self.max_steps > 0, "max_steps 必须 > 0 或为 null"
+        assert 0.0 < self.smoke_min_improvement < 1.0, "smoke_min_improvement 必须在 (0,1)"
+
+
+@dataclass(frozen=True)
+class Loss:
+    huber_delta: float
+    data_weight: float
+    gradient_weight: float
+    divergence_weight: float
+    momentum_weight: float
+    boundary_weight: float
+    physics_warmup_ratio: float
+
+    def __post_init__(self):
+        # 校验对象: loss.* —— 损失尺度为正、权重非负、升权比例合法
+        assert self.huber_delta > 0.0, "loss.huber_delta 必须 > 0"
+        weights = (self.data_weight, self.gradient_weight, self.divergence_weight,
+                   self.momentum_weight, self.boundary_weight)
+        assert all(x >= 0.0 for x in weights), "损失权重不得为负"
+        assert 0.0 <= self.physics_warmup_ratio <= 1.0, "physics_warmup_ratio 必须在 [0,1]"
+
+
+@dataclass(frozen=True)
+class Evaluation:
+    num_visualizations: int
+
+    def __post_init__(self):
+        # 校验对象: evaluation.num_visualizations —— 可为 0（关闭渲染）
+        assert self.num_visualizations >= 0, "num_visualizations 必须 >= 0"
+
+
+@dataclass(frozen=True)
 class Config:
     seed: int
     version: str
@@ -163,6 +279,11 @@ class Config:
     sampler: Sampler
     storage: Storage
     vis: Vis
+    training_data: TrainingData
+    model: Model
+    training: Training
+    loss: Loss
+    evaluation: Evaluation
 
 
 def config_from_dict(raw: dict) -> Config:
@@ -174,7 +295,8 @@ def config_from_dict(raw: dict) -> Config:
         Config；任何非法字段在构造期抛出 AssertionError
     """
     # 校验对象: 顶层键 —— 防止 yaml 笔误产生被静默忽略的多余配置段
-    known = {"seed", "version", "device", "grid", "solver", "airfoil", "sampler", "storage", "vis"}
+    known = {"seed", "version", "device", "grid", "solver", "airfoil", "sampler", "storage", "vis",
+             "training_data", "model", "training", "loss", "evaluation"}
     extra = set(raw) - known
     assert not extra, f"配置存在未知顶层键: {extra}"
     assert raw["device"] in ("auto", "cpu", "cuda"), "device 仅支持 auto|cpu|cuda"
@@ -188,4 +310,9 @@ def config_from_dict(raw: dict) -> Config:
         sampler=Sampler(**raw["sampler"]),
         storage=Storage(**raw["storage"]),
         vis=Vis(**raw["vis"]),
+        training_data=TrainingData(**raw["training_data"]),
+        model=Model(**raw["model"]),
+        training=Training(**raw["training"]),
+        loss=Loss(**raw["loss"]),
+        evaluation=Evaluation(**raw["evaluation"]),
     )

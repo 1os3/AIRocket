@@ -5,7 +5,7 @@
 读取配置: storage.path, storage.map_size_mb, seed, version
 对外接口:
     - FlowFieldWriter: existing_indices(), existing_seeds(), write(plan, fields, extra), write_meta(), close()
-    - FlowFieldDataset: torch Dataset，按位随机读取；get_by_index(sample_index) 精确读取
+    - FlowFieldDataset: torch Dataset，按位随机读取；indices/get_by_index()/close() 精确访问
 说明:
     - 目录结构：storage.path 为数据集根目录；
       meta.lmdb/ 存全局信息（版本/配置快照/种子注册表 seed/%08d），
@@ -16,6 +16,7 @@
 """
 
 import pickle
+from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -113,7 +114,7 @@ class FlowFieldWriter:
 class FlowFieldDataset(torch.utils.data.Dataset):
     """只读随机访问：扫描根目录子库，__getitem__ 按位置取（容忍编号空洞）。"""
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, reader_cache_size: int = 0):
         root = Path(path)
         if not root.exists():
             raise FileNotFoundError(
@@ -122,7 +123,9 @@ class FlowFieldDataset(torch.utils.data.Dataset):
                 "  → 或库在别的路径：用 --env 指定对应配置（如 config/smoke.yaml）。")
         self._root = root
         self._dirs = sorted(root.glob(_SAMPLE_GLOB))
-        self._envs = {}  # 子库句柄惰性缓存：避免每次读取重建 env
+        assert reader_cache_size >= 0, "reader_cache_size 必须 >= 0"
+        self._reader_cache_size = reader_cache_size
+        self._envs = OrderedDict()
         meta_env_path = root / _META_DIR
         self.meta = None
         if meta_env_path.exists():
@@ -137,14 +140,31 @@ class FlowFieldDataset(torch.utils.data.Dataset):
     def __len__(self) -> int:
         return len(self._dirs)
 
+    @property
+    def indices(self) -> list:
+        """返回按目录排序的稳定样本编号，不打开样本数据页。"""
+        return [int(path.stem.removeprefix("sample_")) for path in self._dirs]
+
     def _decode(self, sample_dir: Path) -> dict:
         key = str(sample_dir)
-        if key not in self._envs:
-            self._envs[key] = lmdb.open(key, readonly=True, lock=False, subdir=True,
-                                        readahead=False)
-        with self._envs[key].begin() as txn:
+        temporary = self._reader_cache_size == 0
+        env = self._envs.get(key) if not temporary else None
+        if env is None:
+            env = lmdb.open(key, readonly=True, lock=False, subdir=True, readahead=False)
+        if not temporary:
+            self._envs[key] = env
+            self._envs.move_to_end(key)
+            while len(self._envs) > self._reader_cache_size:
+                _, stale = self._envs.popitem(last=False)
+                stale.close()
+        with env.begin() as txn:
             record = pickle.loads(txn.get(_RECORD_KEY))
-        return {**record, "fields": {k: torch.from_numpy(v) for k, v in record["fields"].items()}}
+            raw_meta = txn.get(_META_KEY)
+        if temporary:
+            env.close()
+        return {**record,
+                "fields": {k: torch.from_numpy(v) for k, v in record["fields"].items()},
+                "sample_meta": pickle.loads(raw_meta) if raw_meta else None}
 
     def __getitem__(self, i: int) -> dict:
         return self._decode(self._dirs[i])
@@ -153,3 +173,13 @@ class FlowFieldDataset(torch.utils.data.Dataset):
         """按样本编号精确读取；不存在返回 None。"""
         sample_dir = _sample_dir(self._root, sample_index)
         return self._decode(sample_dir) if sample_dir.exists() else None
+
+    def close(self) -> None:
+        """关闭本进程 LRU 中仍保留的只读 LMDB 句柄。"""
+        envs = getattr(self, "_envs", None)
+        while envs:
+            _, env = envs.popitem(last=False)
+            env.close()
+
+    def __del__(self):
+        self.close()

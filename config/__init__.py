@@ -45,7 +45,8 @@ def load_config(env_path: str | None = None, base_path: str | None = None) -> Co
         with open(env_path, encoding="utf-8") as f:
             raw = _deep_merge(raw, yaml.safe_load(f) or {})
     root = base.resolve().parent.parent
-    for section, key in (("storage", "path"), ("vis", "out_dir")):
+    for section, key in (("storage", "path"), ("vis", "out_dir"),
+                         ("training_data", "cache_path"), ("training", "output_dir")):
         p = Path(raw[section][key])
         raw[section][key] = str(p if p.is_absolute() else root / p)
     return config_from_dict(raw)

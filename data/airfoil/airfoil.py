@@ -2,7 +2,8 @@
 
 模块: data/airfoil/airfoil.py
 依赖: torch, data.airfoil.checks.airfoil_checks
-读取配置: grid.nx, grid.ny, grid.chord, grid.x_le, grid.y_center, airfoil.n_points
+读取配置: grid.nx, grid.ny, grid.chord, grid.x_le, grid.y_center,
+          airfoil.n_points, airfoil.sdf_chunk_cpu, airfoil.sdf_chunk_cuda
 对外接口:
     - naca4_polygon(m, p, t, n_points, device) -> (K, 2) 张量
     - build_airfoil_polygon(cfg, m, p, t, aoa_deg, device) -> (K, 2) 张量
@@ -14,6 +15,7 @@
 """
 
 import math
+from functools import lru_cache
 
 import torch
 
@@ -74,8 +76,17 @@ def _points_in_polygon(xs: torch.Tensor, ys: torch.Tensor, poly: torch.Tensor) -
     return crosses.sum(dim=1) % 2 == 1
 
 
+def _inside_mask(xs: torch.Tensor, ys: torch.Tensor, poly: torch.Tensor) -> torch.Tensor:
+    """先以严格 AABB 排除不可能在翼型内的点，再执行等价射线法。"""
+    candidates = ((xs >= poly[:, 0].min()) & (xs <= poly[:, 0].max())
+                  & (ys >= poly[:, 1].min()) & (ys <= poly[:, 1].max()))
+    inside = torch.zeros_like(candidates)
+    inside[candidates] = _points_in_polygon(xs[candidates], ys[candidates], poly)
+    return inside
+
+
 def _signed_distance(xs: torch.Tensor, ys: torch.Tensor, poly: torch.Tensor,
-                     inside: torch.Tensor) -> torch.Tensor:
+                     inside: torch.Tensor, chunk: int) -> torch.Tensor:
     """点到边界折线的最近距离，多边形内取负（供 Bouzidi 估计壁面分数 q）。
 
     参数: xs/ys 一维展平坐标；inside 为同形状 bool（True=在多边形内）
@@ -85,7 +96,6 @@ def _signed_distance(xs: torch.Tensor, ys: torch.Tensor, poly: torch.Tensor,
     x2, y2 = torch.roll(x1, -1), torch.roll(y1, -1)
     dx, dy = x2 - x1, y2 - y1
     seg_len2 = (dx * dx + dy * dy).clamp_min(1e-12)
-    chunk = 1 << 14  # 距离场是浮点中间量，块比布尔射线法再小一档
     dist2 = torch.full_like(xs, float("inf"))
     for i in range(0, xs.numel(), chunk):
         # 投影参数截断到 [0,1]，最近点钳在线段上
@@ -96,6 +106,17 @@ def _signed_distance(xs: torch.Tensor, ys: torch.Tensor, poly: torch.Tensor,
     sdf = dist2.sqrt()
     sdf[inside] = -sdf[inside]
     return sdf
+
+
+@lru_cache(maxsize=16)
+def _normalized_grid(nx: int, ny: int, chord: int, x_le: int, y_center: int,
+                     device_name: str, dtype: torch.dtype) -> tuple:
+    """缓存同一网格的归一化点坐标；64k 样本只需分配一次。"""
+    device = torch.device(device_name)
+    xs = (torch.arange(nx, device=device, dtype=dtype) + 0.5 - x_le) / chord
+    ys = (torch.arange(ny, device=device, dtype=dtype) + 0.5 - y_center) / chord
+    yy, xx = torch.meshgrid(ys, xs, indexing="ij")
+    return xx.reshape(-1), yy.reshape(-1)
 
 
 def build_airfoil_geometry(cfg, m: float, p: float, t: float, aoa_deg: float, device) -> tuple:
@@ -109,14 +130,11 @@ def build_airfoil_geometry(cfg, m: float, p: float, t: float, aoa_deg: float, de
     g = cfg.grid
     poly = build_airfoil_polygon(cfg, m, p, t, aoa_deg, device)
     # 网格物理坐标（弦长归一）：翼型前缘置于 (x_le, y_center)，y 轴向上为正
-    xs = (torch.arange(g.nx, device=device, dtype=poly.dtype) + 0.5 - g.x_le) / g.chord
-    ys = (torch.arange(g.ny, device=device, dtype=poly.dtype) + 0.5 - g.y_center) / g.chord
-    yy, xx = torch.meshgrid(ys, xs, indexing="ij")
-    flat_x, flat_y = xx.reshape(-1), yy.reshape(-1)
-    chunk = 1 << 16  # 分块限制 (N×K) 中间布尔张量的显存占用
-    inside = torch.cat([_points_in_polygon(flat_x[i:i + chunk], flat_y[i:i + chunk], poly)
-                        for i in range(0, flat_x.numel(), chunk)])
-    sdf = _signed_distance(flat_x, flat_y, poly, inside) * float(g.chord)  # 换成格子单位
+    flat_x, flat_y = _normalized_grid(
+        g.nx, g.ny, g.chord, g.x_le, g.y_center, str(poly.device), poly.dtype)
+    inside = _inside_mask(flat_x, flat_y, poly)
+    chunk = cfg.airfoil.sdf_chunk_cuda if poly.is_cuda else cfg.airfoil.sdf_chunk_cpu
+    sdf = _signed_distance(flat_x, flat_y, poly, inside, chunk) * float(g.chord)
     return inside.reshape(g.ny, g.nx), sdf.reshape(g.ny, g.nx)
 
 

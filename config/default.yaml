@@ -1,5 +1,5 @@
 # ============================================================================
-# 数据集生成全部可调参数（唯一数据来源，实现文件不得二次声明默认值）
+# 数据生成、模型与训练全部可调参数（唯一数据来源，实现文件不得二次声明默认值）
 #
 # 【单位制说明】LBM 全部在格子单位（lattice units）下运算：长度以格子间距
 #   Δx=1、时间以步长 Δt=1 计。格子量不是米/秒制；物理量 ↔ 格子量的换算
@@ -65,6 +65,8 @@ solver:
 # ----------------------------------------------------------------------------
 airfoil:
   n_points: 128         # 半面取样点数（余弦加密前缘）：多边形精细度，宜 ≥ 2·chord/10
+  sdf_chunk_cpu: 2048   # CPU 精确点到线段距离分块；实测小块可显著降低内存带宽压力
+  sdf_chunk_cuda: 16384 # CUDA 使用大块减少 kernel 启动次数
 
 # ----------------------------------------------------------------------------
 # 工况采样（LHS 拉丁超立方或纯随机；采样表只由 seed+num_samples+method+区间
@@ -98,6 +100,7 @@ storage:
   path: output/flowfield-steady  # v0.2 新库，避免与旧高 Re/旧压力规约样本混合
   map_size_mb: 64         # 每个样本子库的地址空间上限：
                           #   单样本 ≈ nx·ny·(4×4B+1B) ≈ 9MB（默认网格），按 2 倍以上预留
+  reader_cache_size: 16   # 每进程最多同时保持的只读样本 LMDB 句柄；防止大库扫描耗尽句柄
 
 # ----------------------------------------------------------------------------
 # 可视化（vis/run.py；只读 LMDB，PNG 写入 out_dir，均在工作目录内）
@@ -108,3 +111,65 @@ vis:
   dpi: 150              # PNG 分辨率
   num_samples: 4        # 渲染前 N 个样本；0=全部
   fields: [ux, uy, p, speed, rho]   # 横排面板：ux/uy/p/rho/speed 的任意非空子集
+
+# ----------------------------------------------------------------------------
+# 训练缓存：原始流场 LMDB 始终只读，面元基线与监督残差写入独立缓存
+# ----------------------------------------------------------------------------
+training_data:
+  cache_path: output/training-cache
+  split: [0.90, 0.05, 0.05]
+  split_seed: 20260831
+  compression_level: 1
+  prepare_batch_size: 4
+  prepare_cpu_threads: 4
+
+# ----------------------------------------------------------------------------
+# 12 层流场残差 Transformer
+# ----------------------------------------------------------------------------
+model:
+  input_channels: 4
+  output_channels: 3
+  patch_size: 8
+  dim: 384
+  depth: 12
+  heads: 6
+  ffn_hidden: 1536
+  decoder_channels: [192, 96, 48]
+  norm_eps: 1.0e-6
+  dropout: 0.0
+
+# ----------------------------------------------------------------------------
+# 单卡训练；正式训练使用自动混合精度，CPU 冒烟始终为 FP32
+# ----------------------------------------------------------------------------
+training:
+  epochs: 100
+  batch_size: 8
+  gradient_accumulation: 4
+  num_workers: 0
+  lr: 3.0e-4
+  min_lr: 1.0e-6
+  beta1: 0.9
+  beta2: 0.95
+  weight_decay: 0.05
+  warmup_ratio: 0.05
+  grad_clip: 1.0
+  amp_dtype: auto
+  torch_compile: false
+  output_dir: output/training
+  checkpoint_every: 1
+  log_every: 10
+  max_steps: null
+  smoke_min_improvement: 0.10
+
+# 量纲已在实现中统一，以下权重只控制各约束的相对强度
+loss:
+  huber_delta: 0.05
+  data_weight: 1.0
+  gradient_weight: 0.1
+  divergence_weight: 0.01
+  momentum_weight: 0.01
+  boundary_weight: 0.05
+  physics_warmup_ratio: 0.10
+
+evaluation:
+  num_visualizations: 4
