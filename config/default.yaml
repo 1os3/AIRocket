@@ -144,8 +144,8 @@ model:
 # ----------------------------------------------------------------------------
 training:
   epochs: 100
-  batch_size: 48
-  gradient_accumulation: 4
+  batch_size: 32
+  gradient_accumulation: 1
   num_workers: 0
   lr: 2.0e-4
   min_lr: 5.0e-6
@@ -157,7 +157,7 @@ training:
   amp_dtype: auto
   float32_matmul_precision: high # CUDA FP32 矩阵乘启用 TF32 Tensor Core；CPU 不受影响
   torch_compile: true
-  gradient_monitor: true       # 在 log_every 步统计裁剪前的逐参数梯度 RMS
+  gradient_monitor: false       # 在 log_every 步统计裁剪前的逐参数梯度 RMS
   gradient_small_threshold: 1.0e-8 # 参数梯度 RMS 不高于此值视为过小
   output_dir: output/training
   checkpoint_every: 1
