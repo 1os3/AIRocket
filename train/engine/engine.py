@@ -262,6 +262,11 @@ def train_model(cfg, checkpoint: str | None = None) -> dict:
     optimizer = _optimizer(base_model, cfg)
     steps_per_epoch = math.ceil(len(train_loader) / cfg.training.gradient_accumulation)
     total_steps = cfg.training.max_steps or cfg.training.epochs * steps_per_epoch
+    print(f"[train] micro_batch={cfg.training.batch_size} "
+          f"gradient_accumulation={cfg.training.gradient_accumulation} "
+          f"nominal_effective_batch="
+          f"{cfg.training.batch_size * cfg.training.gradient_accumulation} "
+          f"optimizer_steps_per_epoch={steps_per_epoch}")
     scheduler = _scheduler(optimizer, cfg, total_steps)
     scaler = torch.amp.GradScaler("cuda", enabled=amp_dtype == torch.float16) if device.type == "cuda" else None
     start_epoch, global_step, best = 0, 0, float("inf")
@@ -316,7 +321,7 @@ def train_model(cfg, checkpoint: str | None = None) -> dict:
                 row = {"epoch": epoch, "step": global_step, "lr": scheduler.get_last_lr()[0],
                        **{key: float(value.detach()) for key, value in losses.items()}}
                 _write_log(output, row)
-                print(f"[train] epoch={epoch} step={global_step}/{total_steps} "
+                print(f"[train] epoch={epoch} global_step={global_step}/{total_steps} "
                       f"loss={row['total']:.6g} data={row['data']:.6g}")
                 if gradient_stats:
                     _write_log(output, {"epoch": epoch, "step": global_step, **gradient_stats},
@@ -331,6 +336,7 @@ def train_model(cfg, checkpoint: str | None = None) -> dict:
                 stop = True
                 break
         metrics, visual = _evaluate(model, val_loader, cfg, device, amp_dtype)
+        _write_log(output, {"epoch": epoch, "step": global_step, **metrics}, "validation")
         payload = _checkpoint_payload(base_model, optimizer, scheduler, scaler, cfg, epoch,
                                       global_step, min(best, metrics["data"]), train_loader.dataset.manifest)
         if (epoch + 1) % cfg.training.checkpoint_every == 0 or stop:

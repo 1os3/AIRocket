@@ -12,6 +12,7 @@
 
 import hashlib
 import json
+import os
 import pickle
 import zlib
 from pathlib import Path
@@ -31,6 +32,8 @@ __all__ = ["prepare_training_cache", "TrainingFlowDataset"]
 _CACHE_VERSION = "1.0"
 _FINGERPRINT_KEY = b"meta/fingerprint"
 _MANIFEST_KEY = b"meta/manifest"
+_READER_PROCESS_ID = os.getpid()
+_READER_ENVIRONMENTS = {}
 
 
 def _record_key(index: int) -> bytes:
@@ -43,6 +46,20 @@ def _encode(record: dict, level: int) -> bytes:
 
 def _decode(raw: bytes) -> dict:
     return pickle.loads(zlib.decompress(raw))
+
+
+def _reader_environment(path: str):
+    global _READER_PROCESS_ID
+    process_id = os.getpid()
+    if process_id != _READER_PROCESS_ID:
+        # fork 后丢弃父进程继承的 Python 引用；每个 worker 必须自行打开 LMDB。
+        _READER_ENVIRONMENTS.clear()
+        _READER_PROCESS_ID = process_id
+    key = str(Path(path).resolve())
+    if key not in _READER_ENVIRONMENTS:
+        _READER_ENVIRONMENTS[key] = lmdb.open(
+            key, readonly=True, lock=False, readahead=False, subdir=False)
+    return _READER_ENVIRONMENTS[key]
 
 
 def _fingerprint(cfg, indices: list[int], source_meta: dict | None) -> str:
@@ -245,10 +262,13 @@ class TrainingFlowDataset(torch.utils.data.Dataset):
         self._condition_std = torch.tensor(self.manifest["condition_std"], dtype=torch.float32)
         self._target_rms = torch.tensor(self.manifest["target_rms"], dtype=torch.float32)
         self._env = None
+        self._env_process_id = None
 
     def _environment(self):
-        if self._env is None:
-            self._env = lmdb.open(self._path, readonly=True, lock=False, readahead=False, subdir=False)
+        process_id = os.getpid()
+        if self._env is None or self._env_process_id != process_id:
+            self._env = _reader_environment(self._path)
+            self._env_process_id = process_id
         return self._env
 
     def __len__(self) -> int:
@@ -276,4 +296,5 @@ class TrainingFlowDataset(torch.utils.data.Dataset):
     def __getstate__(self):
         state = dict(self.__dict__)
         state["_env"] = None
+        state["_env_process_id"] = None
         return state

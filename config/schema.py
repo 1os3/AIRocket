@@ -149,11 +149,13 @@ class Vis:
     dpi: int
     num_samples: int
     fields: list
+    training_curve_smoothing: int
 
     def __post_init__(self):
         # 校验对象: vis.* —— dpi 正、num_samples 非负、fields 为可渲染面板子集
         assert self.dpi > 0, "vis.dpi 必须 > 0"
         assert self.num_samples >= 0, "vis.num_samples 必须 >= 0"
+        assert self.training_curve_smoothing >= 1, "vis.training_curve_smoothing 必须 >= 1"
         allowed = {"ux", "uy", "p", "rho", "speed"}
         assert self.fields and set(self.fields) <= allowed, (
             f"vis.fields 仅支持 {sorted(allowed)} 的非空子集，得到 {self.fields}")

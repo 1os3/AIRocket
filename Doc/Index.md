@@ -65,4 +65,7 @@
 - `vis/flowfield/__init__.py` — 流场可视化模块重导出
 - `vis/flowfield/flowfield.py` — 流场可视化：从 LMDB 读取稳态样本并渲染多面板 PNG
 - `vis/flowfield/checks/flowfield_checks.py` — flowfield 渲染输入校验
-- `vis/run.py` — CLI 入口：流场可视化（从 LMDB 渲染 PNG，留在 vis 包根）
+- `vis/training_curves/__init__.py` — 训练曲线可视化模块重导出
+- `vis/training_curves/training_curves.py` — 训练损失、验证损失与梯度健康状态的四面板曲线
+- `vis/training_curves/checks/training_curves_checks.py` — 训练曲线主日志存在性校验
+- `vis/run.py` — CLI 入口：流场样本与训练曲线可视化（留在 vis 包根）
