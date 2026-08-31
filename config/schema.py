@@ -217,7 +217,10 @@ class Training:
     warmup_ratio: float
     grad_clip: float
     amp_dtype: str
+    float32_matmul_precision: str
     torch_compile: bool
+    gradient_monitor: bool
+    gradient_small_threshold: float
     output_dir: str
     checkpoint_every: int
     log_every: int
@@ -235,6 +238,10 @@ class Training:
             "weight_decay/warmup_ratio 配置非法")
         assert self.grad_clip > 0.0 and self.amp_dtype in ("auto", "bfloat16", "float16"), (
             "grad_clip/amp_dtype 配置非法")
+        assert self.float32_matmul_precision in ("highest", "high", "medium"), (
+            "float32_matmul_precision 仅支持 highest|high|medium")
+        assert isinstance(self.gradient_monitor, bool) and self.gradient_small_threshold > 0.0, (
+            "gradient_monitor 必须为布尔值且 gradient_small_threshold 必须 > 0")
         assert self.checkpoint_every > 0 and self.log_every > 0, "保存与日志间隔必须 > 0"
         assert self.max_steps is None or self.max_steps > 0, "max_steps 必须 > 0 或为 null"
         assert 0.0 < self.smoke_min_improvement < 1.0, "smoke_min_improvement 必须在 (0,1)"

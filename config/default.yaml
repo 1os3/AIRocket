@@ -97,7 +97,7 @@ sampler:
 #     <path>/sample_00000000.lmdb/ 单样本子库：record（流场+参数元数据）+ meta
 # ----------------------------------------------------------------------------
 storage:
-  path: output/flowfield-steady  # v0.2 新库，避免与旧高 Re/旧压力规约样本混合
+  path: ../data/output/flowfield-steady  # v0.2 新库，避免与旧高 Re/旧压力规约样本混合
   map_size_mb: 64         # 每个样本子库的地址空间上限：
                           #   单样本 ≈ nx·ny·(4×4B+1B) ≈ 9MB（默认网格），按 2 倍以上预留
   reader_cache_size: 16   # 每进程最多同时保持的只读样本 LMDB 句柄；防止大库扫描耗尽句柄
@@ -116,7 +116,7 @@ vis:
 # 训练缓存：原始流场 LMDB 始终只读，面元基线与监督残差写入独立缓存
 # ----------------------------------------------------------------------------
 training_data:
-  cache_path: output/training-cache
+  cache_path: output/training-cach
   split: [0.90, 0.05, 0.05]
   split_seed: 20260831
   compression_level: 1
@@ -143,18 +143,21 @@ model:
 # ----------------------------------------------------------------------------
 training:
   epochs: 100
-  batch_size: 8
+  batch_size: 48
   gradient_accumulation: 4
   num_workers: 0
-  lr: 3.0e-4
-  min_lr: 1.0e-6
+  lr: 2.0e-4
+  min_lr: 5.0e-6
   beta1: 0.9
   beta2: 0.95
   weight_decay: 0.05
   warmup_ratio: 0.05
-  grad_clip: 1.0
+  grad_clip: 10.0
   amp_dtype: auto
-  torch_compile: false
+  float32_matmul_precision: high # CUDA FP32 矩阵乘启用 TF32 Tensor Core；CPU 不受影响
+  torch_compile: true
+  gradient_monitor: true       # 在 log_every 步统计裁剪前的逐参数梯度 RMS
+  gradient_small_threshold: 1.0e-8 # 参数梯度 RMS 不高于此值视为过小
   output_dir: output/training
   checkpoint_every: 1
   log_every: 10
