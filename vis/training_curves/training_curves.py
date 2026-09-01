@@ -1,15 +1,21 @@
 """训练损失、验证损失与梯度健康状态的四面板曲线
 
 模块: vis/training_curves/training_curves.py
-依赖: matplotlib(Agg), numpy, vis.training_curves.checks
+依赖: config, matplotlib(Agg), numpy, vis.training_curves.checks
 读取配置: training.output_dir, vis.dpi, vis.training_curve_smoothing
 对外接口:
     - render_training_curves(cfg) -> Path
+    - main() -> None
 说明: 中断续训产生重复 step 时保留最后一条；损坏的末行跳过，不影响已完成记录。
 """
 
+import argparse
 import json
+import sys
 from pathlib import Path
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import matplotlib
 
@@ -19,7 +25,7 @@ import numpy as np
 
 from vis.training_curves.checks import check_training_log
 
-__all__ = ["render_training_curves"]
+__all__ = ["render_training_curves", "main"]
 
 
 def _read_records(path: Path, required: bool = False) -> list[dict]:
@@ -134,3 +140,17 @@ def render_training_curves(cfg) -> Path:
     plt.close(figure)
     print(f"[curves] 已渲染 {path}")
     return path
+
+
+def main() -> None:
+    """加载统一配置并执行训练曲线 CLI。"""
+    from config import load_config
+
+    parser = argparse.ArgumentParser(description="训练损失与梯度曲线可视化")
+    parser.add_argument("--env", default=None, help="环境覆盖 yaml（如 config/train_smoke.yaml）")
+    args = parser.parse_args()
+    render_training_curves(load_config(env_path=args.env))
+
+
+if __name__ == "__main__":
+    main()
