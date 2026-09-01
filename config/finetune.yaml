@@ -1,0 +1,11 @@
+# 预训练模型微调：较短训练、较小学习率，并温和加强翼面邻域监督。
+training:
+  epochs: 10
+  lr: 2.0e-5
+  min_lr: 5.0e-7
+  warmup_ratio: 0.02
+  output_dir: output/fine-tuning
+
+loss:
+  edge_data_weight: 0.5
+  edge_band_cells: 4.0

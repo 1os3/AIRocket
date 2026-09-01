@@ -169,6 +169,8 @@ training:
 loss:
   huber_delta: 0.05
   data_weight: 1.0
+  edge_data_weight: 0.0   # 翼面邻域额外监督权重；常规训练关闭，微调覆盖配置中温和启用
+  edge_band_cells: 4.0    # 翼面邻域半宽（格子）；由训练缓存中的精确 SDF 判定
   gradient_weight: 0.1
   divergence_weight: 0.01
   momentum_weight: 0.01

@@ -11,6 +11,7 @@
 
 - `config/__init__.py` — 配置加载入口：读 yaml → 合并环境覆盖 → 构造 Config
 - `config/default.yaml` — 数据生成、模型与训练全部可调参数（唯一数据来源）
+- `config/finetune.yaml` — 预训练模型的小学习率与翼面邻域侧重微调覆盖配置
 - `config/schema.py` — 配置类型定义与加载期校验（配置约束的单一来源）
 - `config/train_smoke.yaml` — 正式模型结构的 CPU 最小冒烟与单样本过拟合覆盖
 
@@ -51,13 +52,16 @@
 ## train
 
 - `train/__init__.py` — 训练包声明
-- `train/run.py` — CLI 入口：准备缓存、训练、评估与 CPU 最小冒烟
+- `train/run.py` — CLI 入口：准备缓存、训练、微调、评估与 CPU 最小冒烟
 - `train/losses/__init__.py` — 流场损失模块重导出
-- `train/losses/losses.py` — 监督、稳态 Navier–Stokes 与精确边界物理损失
+- `train/losses/losses.py` — 监督、翼面邻域侧重、稳态 Navier–Stokes 与精确边界物理损失
 - `train/losses/checks/losses_checks.py` — 流场损失输入校验
 - `train/engine/__init__.py` — 训练引擎模块重导出
-- `train/engine/engine.py` — 单卡训练、评估、断点恢复与 CPU 最小过拟合验收
+- `train/engine/engine.py` — 单卡训练、微调、评估、断点恢复与 CPU 最小过拟合验收
 - `train/engine/checks/engine_checks.py` — 训练数据划分非空校验
+- `train/fine_tuning/__init__.py` — 预训练模型微调模块重导出
+- `train/fine_tuning/fine_tuning.py` — 兼容参数部分加载与独立优化状态的模型微调入口
+- `train/fine_tuning/checks/fine_tuning_checks.py` — 预训练检查点与兼容参数校验
 
 ## vis
 

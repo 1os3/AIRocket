@@ -8,3 +8,6 @@ def check_loss_inputs(prediction: torch.Tensor, batch: dict) -> None:
     assert batch["target"].shape == prediction.shape, "target 与 prediction 形状不一致"
     assert batch["mask"].shape == prediction.shape[:1] + prediction.shape[2:], "mask 形状不一致"
     assert batch["target_scale"].shape == (prediction.shape[0], 3), "target_scale 必须为 (B,3)"
+    assert batch["inputs"].shape == prediction.shape[:1] + (4,) + prediction.shape[2:], (
+        "inputs 必须为 (B,4,H,W)，首通道提供翼型 SDF")
+    assert batch["chord"].shape == (prediction.shape[0],), "chord 必须为 (B,)"

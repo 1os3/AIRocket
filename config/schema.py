@@ -253,6 +253,8 @@ class Training:
 class Loss:
     huber_delta: float
     data_weight: float
+    edge_data_weight: float
+    edge_band_cells: float
     gradient_weight: float
     divergence_weight: float
     momentum_weight: float
@@ -262,9 +264,10 @@ class Loss:
     def __post_init__(self):
         # 校验对象: loss.* —— 损失尺度为正、权重非负、升权比例合法
         assert self.huber_delta > 0.0, "loss.huber_delta 必须 > 0"
-        weights = (self.data_weight, self.gradient_weight, self.divergence_weight,
-                   self.momentum_weight, self.boundary_weight)
+        weights = (self.data_weight, self.edge_data_weight, self.gradient_weight,
+                   self.divergence_weight, self.momentum_weight, self.boundary_weight)
         assert all(x >= 0.0 for x in weights), "损失权重不得为负"
+        assert self.edge_band_cells > 0.0, "loss.edge_band_cells 必须 > 0"
         assert 0.0 <= self.physics_warmup_ratio <= 1.0, "physics_warmup_ratio 必须在 [0,1]"
 
 

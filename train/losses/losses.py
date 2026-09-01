@@ -1,4 +1,4 @@
-"""监督、稳态 Navier–Stokes 与精确边界物理损失
+"""监督、翼面邻域侧重、稳态 Navier–Stokes 与精确边界物理损失
 
 模块: train/losses/losses.py
 依赖: torch, train.losses.checks
@@ -121,8 +121,13 @@ def compute_flow_losses(prediction: torch.Tensor, batch: dict, cfg,
     check_loss_inputs(prediction, batch)
     prediction, target = prediction.float(), batch["target"].float()
     fluid = (~batch["mask"]).unsqueeze(1)
-    data = _masked_mean(F.huber_loss(
-        prediction, target, reduction="none", delta=cfg.loss.huber_delta), fluid)
+    point_data = F.huber_loss(
+        prediction, target, reduction="none", delta=cfg.loss.huber_delta)
+    data = _masked_mean(point_data, fluid)
+    distance_cells = batch["inputs"][:, :1].float().abs() \
+        * batch["chord"].float().view(-1, 1, 1, 1)
+    edge = fluid & (distance_cells <= cfg.loss.edge_band_cells)
+    edge_data = _masked_mean(point_data, edge)
     valid = _valid_stencil(~batch["mask"])
     gradient = _gradient_loss(prediction, target, valid, cfg.loss.huber_delta)
     fields = reconstruct_fields(prediction, batch)
@@ -130,9 +135,10 @@ def compute_flow_losses(prediction: torch.Tensor, batch: dict, cfg,
     boundary = _boundary_loss(fields, batch)
     warmup = cfg.loss.physics_warmup_ratio
     physics_scale = 1.0 if warmup == 0.0 else min(1.0, progress / warmup)
-    total = cfg.loss.data_weight * data + cfg.loss.gradient_weight * gradient + physics_scale * (
+    total = (cfg.loss.data_weight * data + cfg.loss.edge_data_weight * edge_data
+             + cfg.loss.gradient_weight * gradient + physics_scale * (
         cfg.loss.divergence_weight * divergence + cfg.loss.momentum_weight * momentum
-        + cfg.loss.boundary_weight * boundary)
-    return {"total": total, "data": data, "gradient": gradient,
+        + cfg.loss.boundary_weight * boundary))
+    return {"total": total, "data": data, "edge_data": edge_data, "gradient": gradient,
             "divergence": divergence, "momentum": momentum, "boundary": boundary,
             "physics_scale": torch.tensor(physics_scale, device=prediction.device)}

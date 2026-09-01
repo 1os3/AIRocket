@@ -112,7 +112,7 @@ def render_training_curves(cfg) -> Path:
         _plot(axes[0, 0], validation, key, label, 1, positive=True, linestyle="--")
     _finish_axis(axes[0, 0], "Primary losses", "Loss", log=True)
 
-    for key in ("gradient", "divergence", "momentum", "boundary"):
+    for key in ("edge_data", "gradient", "divergence", "momentum", "boundary"):
         _plot(axes[0, 1], metrics, key, key, window, positive=True)
     _finish_axis(axes[0, 1], "Raw loss components", "Loss", log=True)
 

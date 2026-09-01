@@ -4,7 +4,7 @@
 依赖: train.engine.engine
 读取配置: 无
 对外接口:
-    - train_model(cfg, checkpoint=None) -> dict
+    - train_model(cfg, checkpoint=None, pretrained_checkpoint=None) -> dict
     - evaluate_model(cfg, checkpoint=None) -> dict
     - smoke_test(cfg) -> dict
 """

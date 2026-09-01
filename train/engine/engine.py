@@ -1,10 +1,10 @@
-"""单卡训练、评估、断点恢复与 CPU 最小过拟合验收
+"""单卡训练、微调、评估、断点恢复与 CPU 最小过拟合验收
 
 模块: train/engine/engine.py
-依赖: torch, matplotlib, data.training_cache, model, train.losses
+依赖: torch, matplotlib, data.training_cache, model, train.fine_tuning, train.losses
 读取配置: device, training.*, evaluation.*, loss.*, vis.cmap, vis.dpi
 对外接口:
-    - train_model(cfg, checkpoint=None) -> dict
+    - train_model(cfg, checkpoint=None, pretrained_checkpoint=None) -> dict
     - evaluate_model(cfg, checkpoint=None) -> dict
     - smoke_test(cfg) -> dict
 说明: CUDA 仅 Transformer 主干进入 autocast；模型自身固定嵌入与解码器为 FP32。
@@ -22,7 +22,8 @@ from torch.utils.data import DataLoader
 
 from data.training_cache import TrainingFlowDataset, prepare_training_cache
 from model import FlowResidualTransformer
-from train.engine.checks import check_dataset
+from train.engine.checks import check_dataset, check_training_initialization
+from train.fine_tuning import load_pretrained_weights
 from train.losses import compute_flow_losses, reconstruct_fields
 
 __all__ = ["train_model", "evaluate_model", "smoke_test"]
@@ -134,13 +135,15 @@ def _scheduler(optimizer, cfg, total_steps: int):
 
 
 def _checkpoint_payload(model, optimizer, scheduler, scaler, cfg,
-                        epoch: int, step: int, best: float, manifest: dict) -> dict:
+                        epoch: int, step: int, best: float, manifest: dict,
+                        pretrained: dict | None = None) -> dict:
     return {
         "model": model.state_dict(), "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict() if scheduler else None,
         "scaler": scaler.state_dict() if scaler else None,
         "epoch": epoch, "step": step, "best": best, "config": cfg,
         "cache_fingerprint": manifest["fingerprint"],
+        "pretrained": pretrained,
         "rng": torch.get_rng_state(),
         "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
     }
@@ -184,7 +187,7 @@ def _write_log(output: Path, row: dict, stem: str = "metrics") -> None:
 @torch.no_grad()
 def _evaluate(model, loader, cfg, device: torch.device, amp_dtype) -> tuple[dict, tuple | None]:
     model.eval()
-    loss_names = ("data", "total", "gradient", "divergence", "momentum", "boundary")
+    loss_names = ("data", "edge_data", "total", "gradient", "divergence", "momentum", "boundary")
     metric_names = tuple(f"{kind}_{metric}_{field}" for kind in ("model", "baseline")
                          for metric in ("rmse", "relative_l2") for field in ("ux", "uy", "p"))
     sums = {key: 0.0 for key in (*loss_names, *metric_names)}
@@ -242,8 +245,10 @@ def _render_visual(visual: tuple | None, output: Path, limit: int, cmap: str, dp
         plt.close(figure)
 
 
-def train_model(cfg, checkpoint: str | None = None) -> dict:
-    """执行正式单卡训练；checkpoint 非空时恢复完整优化状态。"""
+def train_model(cfg, checkpoint: str | None = None,
+                pretrained_checkpoint: str | Path | None = None) -> dict:
+    """执行正式单卡训练；可选择完整续训或仅加载兼容预训练模型参数。"""
+    check_training_initialization(checkpoint, pretrained_checkpoint)
     device = _device(cfg)
     amp_dtype = _amp_dtype(cfg, device)
     _configure_float32_matmul(cfg, device)
@@ -253,6 +258,13 @@ def train_model(cfg, checkpoint: str | None = None) -> dict:
     except AssertionError:
         val_loader = _loader(cfg, "train", False)
     base_model = FlowResidualTransformer(cfg).to(device)
+    pretrained = None
+    if pretrained_checkpoint is not None:
+        pretrained = load_pretrained_weights(base_model, pretrained_checkpoint)
+        print(f"[finetune] loaded={pretrained['loaded_keys']}/{pretrained['total_keys']} "
+              f"parameters={pretrained['loaded_ratio']:.2%} "
+              f"shape_mismatch={len(pretrained['shape_mismatch_keys'])} "
+              f"unexpected={len(pretrained['unexpected_keys'])}")
     model = base_model
     if cfg.training.torch_compile and hasattr(torch, "compile"):
         try:
@@ -274,6 +286,7 @@ def train_model(cfg, checkpoint: str | None = None) -> dict:
         state = _load_checkpoint(checkpoint, base_model, optimizer, scheduler, scaler,
                                  train_loader.dataset.manifest["fingerprint"])
         start_epoch, global_step, best = state["epoch"] + 1, state["step"], state["best"]
+        pretrained = state.get("pretrained")
     output = Path(cfg.training.output_dir)
     optimizer.zero_grad(set_to_none=True)
     stop = False
@@ -338,7 +351,8 @@ def train_model(cfg, checkpoint: str | None = None) -> dict:
         metrics, visual = _evaluate(model, val_loader, cfg, device, amp_dtype)
         _write_log(output, {"epoch": epoch, "step": global_step, **metrics}, "validation")
         payload = _checkpoint_payload(base_model, optimizer, scheduler, scaler, cfg, epoch,
-                                      global_step, min(best, metrics["data"]), train_loader.dataset.manifest)
+                                      global_step, min(best, metrics["data"]),
+                                      train_loader.dataset.manifest, pretrained)
         if (epoch + 1) % cfg.training.checkpoint_every == 0 or stop:
             _atomic_save(payload, output / "latest.pt")
         if metrics["data"] < best:
@@ -352,7 +366,8 @@ def train_model(cfg, checkpoint: str | None = None) -> dict:
               f"baseline={metrics['baseline_rmse_ux']:.6g}")
         if stop:
             break
-    return {"step": global_step, "best": best, "output_dir": str(output)}
+    return {"step": global_step, "best": best, "output_dir": str(output),
+            "pretrained": pretrained}
 
 
 def evaluate_model(cfg, checkpoint: str | None = None) -> dict:
