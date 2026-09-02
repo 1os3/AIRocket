@@ -6,6 +6,7 @@
 - `Doc/Index.md` — 本索引，全项目文档与源文件单一导航入口
 - `Doc/稳态加速.md` — 严格稳态采集的算法、基准、误差与后续加速路线
 - `Doc/模型训练.md` — 流场残差 Transformer、训练缓存、物理损失与精度边界说明
+- `Doc/翼型优化.md` — 训练模型驱动的 NACA 连续参数端到端优化配置与用法
 
 ## config
 
@@ -52,7 +53,10 @@
 ## train
 
 - `train/__init__.py` — 训练包声明
-- `train/run.py` — CLI 入口：准备缓存、训练、微调、评估与 CPU 最小冒烟
+- `train/run.py` — CLI 入口：准备缓存、训练、微调、评估、翼型优化与 CPU 最小冒烟
+- `train/airfoil_optimization/__init__.py` — NACA 翼型参数端到端优化模块重导出
+- `train/airfoil_optimization/airfoil_optimization.py` — 用训练流场模型的梯度直接优化连续 NACA 四位数参数
+- `train/airfoil_optimization/checks/airfoil_optimization_checks.py` — 翼型优化产物与数值状态校验
 - `train/losses/__init__.py` — 流场损失模块重导出
 - `train/losses/losses.py` — 监督、翼面邻域侧重、稳态 Navier–Stokes 与精确边界物理损失
 - `train/losses/checks/losses_checks.py` — 流场损失输入校验

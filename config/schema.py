@@ -6,6 +6,7 @@
 对外接口:
     - Grid / Solver / Airfoil / Sampler / Storage / Vis: 数据生成配置 dataclass
     - TrainingData / Model / Training / Loss / Evaluation: 模型训练配置 dataclass
+    - Optimization*: NACA 翼型参数端到端优化配置 dataclass
     - Config / config_from_dict(raw): 完整配置及构造入口
     - config_from_dict(raw: dict) -> Config
 说明: 约束校验只写在这里（规范 §7.1 唯一例外），运行期 _checks.py 不重复。
@@ -281,6 +282,99 @@ class Evaluation:
 
 
 @dataclass(frozen=True)
+class OptimizationParameter:
+    bounds: list
+    initial: float
+    fixed: bool
+
+    def __post_init__(self):
+        # 校验对象: optimization.parameters.* —— 参数边界非退化且初值位于边界内
+        _range_check("optimization.parameters.*.bounds", self.bounds)
+        assert self.bounds[0] <= self.initial <= self.bounds[1], (
+            f"优化初值 {self.initial} 必须位于 {self.bounds}")
+        assert isinstance(self.fixed, bool), "optimization.parameters.*.fixed 必须为布尔值"
+
+
+@dataclass(frozen=True)
+class OptimizationParameters:
+    naca_m: OptimizationParameter
+    naca_p: OptimizationParameter
+    naca_t: OptimizationParameter
+
+    def __post_init__(self):
+        # 校验对象: optimization.parameters —— NACA 四位数参数必须处于物理合法域
+        assert 0.0 <= self.naca_m.bounds[0] and self.naca_m.bounds[1] <= 0.1, (
+            "optimization.parameters.naca_m.bounds 必须在 [0,0.1]")
+        assert 0.0 < self.naca_p.bounds[0] and self.naca_p.bounds[1] < 1.0, (
+            "optimization.parameters.naca_p.bounds 必须在 (0,1)")
+        assert 0.0 < self.naca_t.bounds[0] and self.naca_t.bounds[1] <= 0.3, (
+            "optimization.parameters.naca_t.bounds 必须在 (0,0.3]")
+        assert any(not value.fixed for value in (self.naca_m, self.naca_p, self.naca_t)), (
+            "optimization.parameters 至少保留一个待优化参数")
+
+
+@dataclass(frozen=True)
+class OptimizationFlow:
+    u_lb: float
+    reynolds: float
+    aoa_deg: float
+
+    def __post_init__(self):
+        # 校验对象: optimization.flow —— 固定工况须符合格子低马赫与正黏性要求
+        assert 0.0 < self.u_lb < 0.5, "optimization.flow.u_lb 必须在 (0,0.5)"
+        assert self.reynolds > 0.0, "optimization.flow.reynolds 必须 > 0"
+        assert -90.0 < self.aoa_deg < 90.0, "optimization.flow.aoa_deg 必须在 (-90,90)"
+
+
+@dataclass(frozen=True)
+class OptimizationObjective:
+    mode: str
+    target_lift: float
+    lift_weight: float
+    drag_weight: float
+    drag_epsilon: float
+
+    def __post_init__(self):
+        # 校验对象: optimization.objective —— 目标模式与数值尺度必须有效
+        allowed = {"maximize_lift", "minimize_drag", "maximize_lift_to_drag",
+                   "target_lift_min_drag"}
+        assert self.mode in allowed, f"optimization.objective.mode 仅支持 {sorted(allowed)}"
+        assert self.lift_weight > 0.0 and self.drag_weight > 0.0, (
+            "optimization.objective 的 lift_weight/drag_weight 必须 > 0")
+        assert self.drag_epsilon > 0.0, "optimization.objective.drag_epsilon 必须 > 0"
+
+
+@dataclass(frozen=True)
+class Optimization:
+    checkpoint: str
+    output_dir: str
+    steps: int
+    learning_rate: float
+    beta1: float
+    beta2: float
+    epsilon: float
+    grad_clip: float
+    log_every: int
+    surface_offset_cells: float
+    flow: OptimizationFlow
+    parameters: OptimizationParameters
+    objective: OptimizationObjective
+
+    def __post_init__(self):
+        # 校验对象: optimization.* —— 迭代、日志与表面采样设置必须为正
+        assert self.checkpoint, "optimization.checkpoint 不得为空"
+        assert self.output_dir, "optimization.output_dir 不得为空"
+        assert (self.steps > 0 and self.learning_rate > 0.0 and self.epsilon > 0.0
+                and self.grad_clip > 0.0
+                and self.log_every > 0), (
+            "optimization.steps/learning_rate/epsilon/grad_clip/log_every 必须 > 0")
+        assert 0.0 < self.beta1 < 1.0 and 0.0 < self.beta2 < 1.0, (
+            "optimization.beta1/beta2 必须在 (0,1)")
+        assert self.surface_offset_cells > 0.0, (
+            "optimization.surface_offset_cells 必须 > 0")
+
+
+@dataclass(frozen=True)
 class Config:
     seed: int
     version: str
@@ -296,6 +390,7 @@ class Config:
     training: Training
     loss: Loss
     evaluation: Evaluation
+    optimization: Optimization
 
 
 def config_from_dict(raw: dict) -> Config:
@@ -308,10 +403,12 @@ def config_from_dict(raw: dict) -> Config:
     """
     # 校验对象: 顶层键 —— 防止 yaml 笔误产生被静默忽略的多余配置段
     known = {"seed", "version", "device", "grid", "solver", "airfoil", "sampler", "storage", "vis",
-             "training_data", "model", "training", "loss", "evaluation"}
+             "training_data", "model", "training", "loss", "evaluation", "optimization"}
     extra = set(raw) - known
     assert not extra, f"配置存在未知顶层键: {extra}"
     assert raw["device"] in ("auto", "cpu", "cuda"), "device 仅支持 auto|cpu|cuda"
+    optimization = raw["optimization"]
+    parameters = optimization["parameters"]
     return Config(
         seed=int(raw["seed"]),
         version=str(raw["version"]),
@@ -327,4 +424,12 @@ def config_from_dict(raw: dict) -> Config:
         training=Training(**raw["training"]),
         loss=Loss(**raw["loss"]),
         evaluation=Evaluation(**raw["evaluation"]),
+        optimization=Optimization(
+            **{key: value for key, value in optimization.items()
+               if key not in ("flow", "parameters", "objective")},
+            flow=OptimizationFlow(**optimization["flow"]),
+            parameters=OptimizationParameters(**{
+                key: OptimizationParameter(**value) for key, value in parameters.items()}),
+            objective=OptimizationObjective(**optimization["objective"]),
+        ),
     )

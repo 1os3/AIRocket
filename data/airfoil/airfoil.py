@@ -104,8 +104,7 @@ def _signed_distance(xs: torch.Tensor, ys: torch.Tensor, poly: torch.Tensor,
         d2 = (xs[i:i + chunk, None] - (x1 + u * dx)) ** 2 + (ys[i:i + chunk, None] - (y1 + u * dy)) ** 2
         dist2[i:i + chunk] = d2.min(dim=1).values
     sdf = dist2.sqrt()
-    sdf[inside] = -sdf[inside]
-    return sdf
+    return torch.where(inside, -sdf, sdf)
 
 
 @lru_cache(maxsize=16)

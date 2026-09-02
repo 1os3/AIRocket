@@ -179,3 +179,50 @@ loss:
 
 evaluation:
   num_visualizations: 4
+
+# ----------------------------------------------------------------------------
+# 训练模型驱动的 NACA 参数端到端优化；网格始终只由 grid 段定义且不会被优化
+# ----------------------------------------------------------------------------
+optimization:
+  checkpoint: output/training/best.pt # 已训练模型；须与 training_data 缓存指纹一致
+  output_dir: output/optimization
+  steps: 200
+  learning_rate: 5.0e-4
+  beta1: 0.9
+  beta2: 0.999
+  epsilon: 1.0e-8
+  grad_clip: 1.0
+  log_every: 10
+  # 气动力积分先取每段连续 NACA 轮廓的中点，再沿该处外法线向流体侧偏移此距离
+  # （单位为网格间距），并双线性采样预测压力与速度梯度。直接在数学表面采样会混入
+  # 固体掩码内被置零的速度和阶梯状界面跳变；偏移过小仍会受固体节点污染，过大则会
+  # 离开近壁区。该值只决定读场位置，不移动翼型、不修改网格，也不是边界层厚度。
+  surface_offset_cells: 1.5
+  flow:
+    u_lb: 0.10           # 固定格子流速，不是 m/s；须落在模型训练覆盖范围内
+    reynolds: 300.0      # 实际格子雷诺数，据此计算 nu=u_lb*chord/Re
+    aoa_deg: 4.0         # 固定来流攻角（通过旋转翼型实现）
+  parameters:
+    naca_m:
+      bounds: [0.0, 0.06]
+      initial: 0.02
+      fixed: false
+    naca_p:
+      bounds: [0.2, 0.6]
+      initial: 0.4
+      fixed: false
+    naca_t:
+      bounds: [0.08, 0.18]
+      initial: 0.12
+      fixed: false
+  objective:
+    # maximize_lift：最小化 -Cl，适合只追求更大升力。
+    # minimize_drag：最小化 Cd 的平滑绝对值，避免模型给出负阻力时反向钻空子。
+    # maximize_lift_to_drag：最小化 -Cl/sqrt(Cd²+drag_epsilon²)，用于提高气动效率。
+    # target_lift_min_drag：最小化 lift_weight*(Cl-target_lift)²
+    #                       + drag_weight*sqrt(Cd²+drag_epsilon²)，用于满足升力约束后减阻。
+    mode: maximize_lift_to_drag
+    target_lift: 0.5            # 仅 target_lift_min_drag 使用
+    lift_weight: 1.0            # 仅 target_lift_min_drag 使用
+    drag_weight: 0.1            # 仅 target_lift_min_drag 使用
+    drag_epsilon: 1.0e-3        # 升阻比与阻力绝对值的数值稳定项
