@@ -10,6 +10,7 @@
           sampler.u_lb_max, sampler.u_lb_fixed, sampler.num_samples
 对外接口:
     - collect(cfg) -> dict（written / skipped_done / failed / total 统计）
+    - solve_plans(cfg, plans) -> tuple[dict, list]（不入库的同批稳态求解）
 说明:
     - 续采：按 LMDB 已有 index 跳过；采样计划只由 (seed, num_samples, method, 区间) 决定，
       故重算计划必与已入库样本一致，不会复用种子（另以库内种子集合兜底校验）。
@@ -30,7 +31,7 @@ from data.potential_initializer import build_potential_initial
 from data.sampler import plan_samples
 from data.storage import FlowFieldWriter
 
-__all__ = ["collect"]
+__all__ = ["collect", "solve_plans"]
 
 _CS = math.sqrt(CS2)
 
@@ -149,10 +150,9 @@ def _mask_initial_velocity(initial: dict, masks: torch.Tensor) -> dict:
     return initial
 
 
-def _run_batch(cfg, solver, writer, plans, device, initial=None,
-               return_state: bool = False, progress_offset: int = 0,
-               progress_total: int | None = None) -> tuple:
-    """跑一批样本并逐样本入库，返回本批统计。"""
+def _solve_batch(cfg, solver, plans, device, initial=None,
+                 return_state: bool = False) -> tuple:
+    """执行粗细网格稳态求解，但不产生存储副作用。"""
     sequence = None
     geometry_cfg = cfg
     use_grid_sequence = cfg.solver.grid_sequence and (
@@ -218,6 +218,14 @@ def _run_batch(cfg, solver, writer, plans, device, initial=None,
                           for coarse_step, fine_step in zip(coarse_steps, out["steps"])]
     out["grid_sequence_used"] = sequence is not None
     check_batch_step_accounting(cfg, out, len(plans))
+    return out, lats
+
+
+def _run_batch(cfg, solver, writer, plans, device, initial=None,
+               return_state: bool = False, progress_offset: int = 0,
+               progress_total: int | None = None) -> tuple:
+    """跑一批样本并逐样本入库，返回本批统计。"""
+    out, lats = _solve_batch(cfg, solver, plans, device, initial, return_state)
     stats = {"written": 0, "failed": 0}
     for j, (p, lat) in enumerate(zip(plans, lats)):
         progress = progress_offset + j + 1
@@ -238,6 +246,20 @@ def _run_batch(cfg, solver, writer, plans, device, initial=None,
               f"（{route}），已写入")
         stats["written"] += 1
     return stats, out
+
+
+def solve_plans(cfg, plans) -> tuple[dict, list]:
+    """按采集同款粗细网格、初值与收敛判据求解指定计划，但不写入 LMDB。
+
+    参数:
+        cfg: 完整配置对象
+        plans: 含 Re/Ma/攻角/NACA 参数的计划列表
+    返回:
+        `(out, lattice_params)`；out 含场量、收敛标记及粗细网格步数
+    """
+    device = _resolve_device(cfg.device)
+    solver = LBMSolver(cfg, device)
+    return _solve_batch(cfg, solver, plans, device)
 
 
 def collect(cfg) -> dict:

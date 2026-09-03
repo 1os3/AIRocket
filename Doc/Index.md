@@ -25,6 +25,9 @@
 - `data/airfoil/__init__.py` — 翼型模块重导出
 - `data/airfoil/airfoil.py` — 参数化翼型生成与 GPU 栅格化：NACA 四位数族 → 反弹边界掩码与有符号距离场
 - `data/airfoil/checks/airfoil_checks.py` — airfoil 入参校验
+- `data/aerodynamics/__init__.py` — 翼型气动力系数与优化目标模块重导出
+- `data/aerodynamics/aerodynamics.py` — 在连续翼型轮廓上积分预测或 LBM 流场的升阻系数
+- `data/aerodynamics/checks/aerodynamics_checks.py` — 气动力积分场量与轮廓输入校验
 - `data/potential_initializer/__init__.py` — 无粘源面元初值模块重导出
 - `data/potential_initializer/potential_initializer.py` — 无粘源面元近似：为黏性 LBM 构造满足翼面不穿透的初始速度场
 - `data/potential_initializer/checks/potential_initializer_checks.py` — potential_initializer 入参校验
@@ -80,4 +83,7 @@
 - `vis/inference/inference.py` — 用训练检查点或确定性随机初始化模型渲染流场推理对比图
 - `vis/inference/checks/__init__.py` — 模型推理可视化校验重导出
 - `vis/inference/checks/inference_checks.py` — 模型推理样本与检查点兼容性校验
-- `vis/run.py` — CLI 入口：流场样本、训练曲线与模型推理可视化（留在 vis 包根）
+- `vis/optimization_lbm/__init__.py` — 优化翼型 LBM 复核与对比可视化模块重导出
+- `vis/optimization_lbm/optimization_lbm.py` — 用同工况 LBM 复核优化翼型并渲染初始与最优流场对比
+- `vis/optimization_lbm/checks/optimization_lbm_checks.py` — LBM 复核优化结果与求解输出校验
+- `vis/run.py` — CLI 入口：流场样本、训练曲线、模型推理与优化翼型 LBM 复核（留在 vis 包根）

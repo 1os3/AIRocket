@@ -5,8 +5,9 @@
 读取配置: 无（见 collector.py 文件头）
 对外接口:
     - collect(cfg) -> dict(统计信息)
+    - solve_plans(cfg, plans) -> tuple[dict, list]
 """
 
-from data.collector.collector import collect
+from data.collector.collector import collect, solve_plans
 
-__all__ = ["collect"]
+__all__ = ["collect", "solve_plans"]

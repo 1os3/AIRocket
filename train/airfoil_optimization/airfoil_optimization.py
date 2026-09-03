@@ -1,7 +1,7 @@
 """用训练流场模型的梯度直接优化连续 NACA 四位数参数
 
 模块: train/airfoil_optimization/airfoil_optimization.py
-依赖: torch, data.airfoil, data.potential_initializer, model, train.losses,
+依赖: torch, data.aerodynamics, data.airfoil, data.potential_initializer, model, train.losses,
       train.airfoil_optimization.checks
 读取配置: seed, device, grid.*, airfoil.*, solver.potential_*, training.amp_dtype,
           training.float32_matmul_precision, training_data.cache_path, model.*,
@@ -20,9 +20,9 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
+from data.aerodynamics import compute_force_coefficients, compute_optimization_objective
 from data.airfoil import build_airfoil_geometry, build_airfoil_polygon
 from data.potential_initializer import build_potential_initial
 from model import FlowResidualTransformer
@@ -145,80 +145,6 @@ def _build_batch(cfg, values: dict, manifest: dict,
         flow.aoa_deg, device)
 
 
-def _derivatives(field: torch.Tensor, chord: float) -> tuple[torch.Tensor, torch.Tensor]:
-    dx = torch.zeros_like(field)
-    dx[..., 1:-1] = 0.5 * (field[..., 2:] - field[..., :-2]) * chord
-    dy = 0.5 * (torch.roll(field, -1, dims=-2)
-                - torch.roll(field, 1, dims=-2)) * chord
-    return dx, dy
-
-
-def _sample_surface(values: torch.Tensor, points: torch.Tensor, cfg) -> torch.Tensor:
-    x = (points[:, 0] * cfg.grid.chord + cfg.grid.x_le) * (2.0 / cfg.grid.nx) - 1.0
-    y = (points[:, 1] * cfg.grid.chord + cfg.grid.y_center) * (2.0 / cfg.grid.ny) - 1.0
-    grid = torch.stack([x, y], dim=1).view(1, -1, 1, 2)
-    return F.grid_sample(
-        values, grid, mode="bilinear", padding_mode="border", align_corners=False)[0, :, :, 0]
-
-
-def _force_coefficients(fields: dict, polygon: torch.Tensor, cfg) -> dict:
-    """沿连续翼型表面积分压力和黏性应力，返回来流坐标系下 Cl/Cd。
-
-    每段轮廓取中点并沿外法线向流体侧偏移 surface_offset_cells 个网格间距，
-    再双线性采样压力和速度梯度。这样避免数学表面两侧同时插值到固体掩码内的
-    零速度；偏移只改变预测场的读取位置，不改变翼型坐标或计算网格。
-    """
-    end = torch.roll(polygon, -1, dims=0)
-    segment = end - polygon
-    length = torch.linalg.vector_norm(segment, dim=1).clamp_min(torch.finfo(polygon.dtype).eps)
-    tangent = segment / length.unsqueeze(1)
-    left_normal = torch.stack([-tangent[:, 1], tangent[:, 0]], dim=1)
-    signed_area = 0.5 * (polygon[:, 0] * end[:, 1] - end[:, 0] * polygon[:, 1]).sum()
-    normal = left_normal * torch.where(signed_area < 0.0, 1.0, -1.0)
-    midpoint = 0.5 * (polygon + end)
-    sample_points = midpoint + normal * (
-        cfg.optimization.surface_offset_cells / float(cfg.grid.chord))
-
-    normalized = fields["normalized"]
-    ux, uy = normalized[:, 0], normalized[:, 1]
-    dux_dx, dux_dy = _derivatives(ux, float(cfg.grid.chord))
-    duy_dx, duy_dy = _derivatives(uy, float(cfg.grid.chord))
-    surface = _sample_surface(torch.stack([
-        normalized[:, 2], dux_dx, dux_dy, duy_dx, duy_dy,
-    ], dim=1), sample_points, cfg)
-    pressure, dux_dx, dux_dy, duy_dx, duy_dy = surface
-    shear = dux_dy + duy_dx
-    viscous_x = 2.0 * dux_dx * normal[:, 0] + shear * normal[:, 1]
-    viscous_y = shear * normal[:, 0] + 2.0 * duy_dy * normal[:, 1]
-    viscous = torch.stack([viscous_x, viscous_y], dim=1)
-    traction = -2.0 * pressure.unsqueeze(1) * normal \
-        + (2.0 / cfg.optimization.flow.reynolds) * viscous
-    coefficient = (traction * length.unsqueeze(1)).sum(dim=0)
-    return {"lift": coefficient[1], "drag": coefficient[0]}
-
-
-def _objective(coefficients: dict, cfg) -> tuple[torch.Tensor, torch.Tensor]:
-    """把 Cl/Cd 转成最小化目标。
-
-    maximize_lift 使用 -Cl；minimize_drag 使用 sqrt(Cd²+drag_epsilon²)；
-    maximize_lift_to_drag 使用 -Cl/sqrt(Cd²+drag_epsilon²)；target_lift_min_drag
-    使用升力目标平方误差与平滑阻力加权和。
-    """
-    objective = cfg.optimization.objective
-    lift, drag = coefficients["lift"], coefficients["drag"]
-    drag_magnitude = torch.sqrt(drag.square() + objective.drag_epsilon ** 2)
-    if objective.mode == "maximize_lift":
-        loss = -lift
-    elif objective.mode == "minimize_drag":
-        loss = drag_magnitude
-    elif objective.mode == "maximize_lift_to_drag":
-        loss = -lift / drag_magnitude
-    else:
-        loss = (objective.lift_weight * (lift - objective.target_lift).square()
-                + objective.drag_weight * drag_magnitude)
-    return loss, lift / drag_magnitude
-
-
 def _write_results(cfg, checkpoint: Path, history: list[dict], best: dict) -> dict:
     output = Path(cfg.optimization.output_dir)
     output.mkdir(parents=True, exist_ok=True)
@@ -235,6 +161,7 @@ def _write_results(cfg, checkpoint: Path, history: list[dict], best: dict) -> di
             "aoa_deg": cfg.optimization.flow.aoa_deg,
         },
         "parameters": asdict(cfg.optimization.parameters),
+        "surface_offset_cells": cfg.optimization.surface_offset_cells,
         "best": best,
         "iterations": len(history) - 1,
     }
@@ -273,8 +200,11 @@ def optimize_airfoil(cfg, checkpoint: str | Path | None = None) -> dict:
         with _autocast(cfg, device):
             prediction = model(batch["inputs"], batch["conditions"])
         fields = reconstruct_fields(prediction, batch)
-        coefficients = _force_coefficients(fields, polygon, cfg)
-        loss, ratio = _objective(coefficients, cfg)
+        coefficients = compute_force_coefficients(
+            fields, polygon, cfg, cfg.optimization.flow.u_lb,
+            cfg.optimization.flow.reynolds, cfg.optimization.surface_offset_cells)
+        loss, ratio = compute_optimization_objective(
+            coefficients, cfg.optimization.objective)
         check_optimization_state(loss, coefficients, values)
         row = {
             "step": step,
