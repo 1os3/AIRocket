@@ -85,16 +85,18 @@ def compute_optimization_objective(coefficients: dict, objective_cfg) -> tuple:
     """
     lift, drag = coefficients["lift"], coefficients["drag"]
     drag_magnitude = torch.sqrt(drag.square() + objective_cfg.drag_epsilon ** 2)
+    minimum_lift = torch.as_tensor(
+        objective_cfg.minimum_lift, dtype=lift.dtype, device=lift.device)
     if objective_cfg.mode == "maximize_lift":
         base = -lift
     elif objective_cfg.mode == "minimize_drag":
         base = drag_magnitude
     elif objective_cfg.mode == "maximize_lift_to_drag":
-        base = -lift / drag_magnitude
+        # 不可行区使用正的分子下限，使减小目标同时增升、减阻；可行区恢复原升阻比。
+        base = -torch.maximum(lift, minimum_lift) / drag_magnitude
     else:
         base = (objective_cfg.lift_weight * (lift - objective_cfg.target_lift).square()
                 + objective_cfg.drag_weight * drag_magnitude)
-    violation = torch.relu(
-        torch.as_tensor(objective_cfg.minimum_lift, dtype=lift.dtype, device=lift.device) - lift)
+    violation = torch.relu(minimum_lift - lift)
     objective = base + objective_cfg.lift_constraint_weight * violation
     return objective, lift / drag_magnitude, violation

@@ -222,7 +222,8 @@ optimization:
     # 违约时统一加 lift_constraint_weight*relu(minimum_lift-Cl)，持续把 Cl 推向正值。
     # maximize_lift：最小化 -Cl，适合只追求更大升力。
     # minimize_drag：最小化 Cd 的平滑绝对值，避免模型给出负阻力时反向钻空子。
-    # maximize_lift_to_drag：最小化 -Cl/sqrt(Cd²+drag_epsilon²)，用于提高气动效率。
+    # maximize_lift_to_drag：可行区最小化 -Cl/sqrt(Cd²+drag_epsilon²)；不可行区把分子
+    #                         固定为 minimum_lift，使梯度先增升、减阻，不再靠增阻改善负升阻比。
     # target_lift_min_drag：最小化 lift_weight*(Cl-target_lift)²
     #                       + drag_weight*sqrt(Cd²+drag_epsilon²)，用于满足升力约束后减阻。
     mode: maximize_lift_to_drag
