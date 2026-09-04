@@ -28,6 +28,7 @@ from data.potential_initializer import build_potential_initial
 from model import FlowResidualTransformer
 from train.airfoil_optimization.checks import (
     check_optimization_checkpoint,
+    check_optimization_gradients,
     check_optimization_request,
     check_optimization_state,
 )
@@ -237,8 +238,10 @@ def optimize_airfoil(cfg, checkpoint: str | Path | None = None) -> dict:
             break
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
+        check_optimization_gradients(parameters.named_parameters())
         torch.nn.utils.clip_grad_norm_(
-            parameters.parameters(), max_norm=cfg.optimization.grad_clip)
+            parameters.parameters(), max_norm=cfg.optimization.grad_clip,
+            error_if_nonfinite=True)
         optimizer.step()
         parameters.project()
 

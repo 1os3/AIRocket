@@ -28,3 +28,13 @@ def check_optimization_state(loss: torch.Tensor, coefficients: dict,
     # 校验对象: 每步目标、升阻系数与 NACA 参数 —— 非有限值会使后续更新失去意义
     values = torch.stack([loss, *coefficients.values(), *parameters.values()])
     assert bool(torch.isfinite(values).all()), "翼型优化出现 NaN/Inf，请检查工况与参数范围"
+
+
+def check_optimization_gradients(named_parameters) -> None:
+    # 校验对象: loss.backward 后的待优化参数梯度 —— 坏梯度不得进入裁剪器和 Adam 状态
+    gradients = [(name, parameter.grad) for name, parameter in named_parameters]
+    missing = [name for name, gradient in gradients if gradient is None]
+    invalid = [name for name, gradient in gradients
+               if gradient is not None and not bool(torch.isfinite(gradient).all())]
+    assert not missing, f"翼型优化参数缺少梯度：{missing}"
+    assert not invalid, f"翼型优化参数梯度出现 NaN/Inf：{invalid}"

@@ -3,7 +3,8 @@
 模块: data/airfoil/airfoil.py
 依赖: torch, data.airfoil.checks.airfoil_checks
 读取配置: grid.nx, grid.ny, grid.chord, grid.x_le, grid.y_center,
-          airfoil.n_points, airfoil.sdf_chunk_cpu, airfoil.sdf_chunk_cuda
+          airfoil.n_points, airfoil.sdf_chunk_cpu, airfoil.sdf_chunk_cuda,
+          airfoil.sdf_backward_epsilon
 对外接口:
     - naca4_polygon(m, p, t, n_points, device) -> (K, 2) 张量
     - build_airfoil_polygon(cfg, m, p, t, aoa_deg, device) -> (K, 2) 张量
@@ -22,6 +23,22 @@ import torch
 from data.airfoil.checks.airfoil_checks import check_naca_params
 
 __all__ = ["naca4_polygon", "build_airfoil_polygon", "build_airfoil_geometry", "build_airfoil_mask"]
+
+
+class _ExactSqrtSmoothBackward(torch.autograd.Function):
+    """前向保持精确平方根，反向在零距离附近使用有限的平滑代理导数。"""
+
+    @staticmethod
+    def forward(ctx, squared: torch.Tensor, epsilon: float) -> torch.Tensor:
+        ctx.save_for_backward(squared)
+        ctx.epsilon = epsilon
+        return torch.sqrt(squared)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> tuple:
+        (squared,) = ctx.saved_tensors
+        denominator = 2.0 * torch.sqrt(squared + ctx.epsilon ** 2)
+        return grad_output / denominator, None
 
 
 def naca4_polygon(m: float, p: float, t: float, n_points: int, device) -> torch.Tensor:
@@ -86,7 +103,8 @@ def _inside_mask(xs: torch.Tensor, ys: torch.Tensor, poly: torch.Tensor) -> torc
 
 
 def _signed_distance(xs: torch.Tensor, ys: torch.Tensor, poly: torch.Tensor,
-                     inside: torch.Tensor, chunk: int) -> torch.Tensor:
+                     inside: torch.Tensor, chunk: int,
+                     backward_epsilon: float) -> torch.Tensor:
     """点到边界折线的最近距离，多边形内取负（供 Bouzidi 估计壁面分数 q）。
 
     参数: xs/ys 一维展平坐标；inside 为同形状 bool（True=在多边形内）
@@ -103,7 +121,8 @@ def _signed_distance(xs: torch.Tensor, ys: torch.Tensor, poly: torch.Tensor,
              / seg_len2).clamp(0.0, 1.0)
         d2 = (xs[i:i + chunk, None] - (x1 + u * dx)) ** 2 + (ys[i:i + chunk, None] - (y1 + u * dy)) ** 2
         dist2[i:i + chunk] = d2.min(dim=1).values
-    sdf = dist2.sqrt()
+    # 精确前向值供缓存/LBM 共用；自定义反向只消除 sqrt(0) 的无穷导数。
+    sdf = _ExactSqrtSmoothBackward.apply(dist2, backward_epsilon)
     return torch.where(inside, -sdf, sdf)
 
 
@@ -133,7 +152,9 @@ def build_airfoil_geometry(cfg, m: float, p: float, t: float, aoa_deg: float, de
         g.nx, g.ny, g.chord, g.x_le, g.y_center, str(poly.device), poly.dtype)
     inside = _inside_mask(flat_x, flat_y, poly)
     chunk = cfg.airfoil.sdf_chunk_cuda if poly.is_cuda else cfg.airfoil.sdf_chunk_cpu
-    sdf = _signed_distance(flat_x, flat_y, poly, inside, chunk) * float(g.chord)
+    sdf = _signed_distance(
+        flat_x, flat_y, poly, inside, chunk,
+        cfg.airfoil.sdf_backward_epsilon) * float(g.chord)
     return inside.reshape(g.ny, g.nx), sdf.reshape(g.ny, g.nx)
 
 

@@ -94,11 +94,15 @@ class Airfoil:
     n_points: int
     sdf_chunk_cpu: int
     sdf_chunk_cuda: int
+    sdf_backward_epsilon: float
 
     def __post_init__(self):
         # 校验对象: airfoil.n_points —— 至少 8 点才能勾勒厚度分布
         assert self.n_points >= 8, "airfoil.n_points 必须 >= 8"
         assert self.sdf_chunk_cpu > 0 and self.sdf_chunk_cuda > 0, "SDF 分块必须 > 0"
+        # 校验对象: airfoil.sdf_backward_epsilon —— 防止平方下溢且只平滑极近壁梯度
+        assert 1.0e-12 <= self.sdf_backward_epsilon <= 1.0e-2, (
+            "airfoil.sdf_backward_epsilon 必须在 [1e-12,1e-2]")
 
 
 @dataclass(frozen=True)

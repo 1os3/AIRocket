@@ -67,6 +67,8 @@ airfoil:
   n_points: 128         # 半面取样点数（余弦加密前缘）：多边形精细度，宜 ≥ 2·chord/10
   sdf_chunk_cpu: 2048   # CPU 精确点到线段距离分块；实测小块可显著降低内存带宽压力
   sdf_chunk_cuda: 16384 # CUDA 使用大块减少 kernel 启动次数
+  # SDF 前向仍为精确 sqrt(dist²)；仅将反向分母改为 2*sqrt(dist²+epsilon²)，避免零距离 NaN。
+  sdf_backward_epsilon: 1.0e-6 # 弦长归一化距离，只影响反向代理梯度，不改变任何前向值
 
 # ----------------------------------------------------------------------------
 # 工况采样（LHS 拉丁超立方或纯随机；采样表只由 seed+num_samples+method+区间
