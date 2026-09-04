@@ -78,16 +78,23 @@ def compute_force_coefficients(fields: dict, polygon: torch.Tensor, cfg, u_lb,
 
 
 def compute_optimization_objective(coefficients: dict, objective_cfg) -> tuple:
-    """按配置模式把 Cl/Cd 转成待最小化目标，并返回带符号的平滑升阻比。"""
+    """按模式构造基础目标，再统一加入正升力违约项。
+
+    返回:
+        `(objective, lift_to_drag, lift_violation)`；最后一项是正升力门槛缺口
+    """
     lift, drag = coefficients["lift"], coefficients["drag"]
     drag_magnitude = torch.sqrt(drag.square() + objective_cfg.drag_epsilon ** 2)
     if objective_cfg.mode == "maximize_lift":
-        loss = -lift
+        base = -lift
     elif objective_cfg.mode == "minimize_drag":
-        loss = drag_magnitude
+        base = drag_magnitude
     elif objective_cfg.mode == "maximize_lift_to_drag":
-        loss = -lift / drag_magnitude
+        base = -lift / drag_magnitude
     else:
-        loss = (objective_cfg.lift_weight * (lift - objective_cfg.target_lift).square()
+        base = (objective_cfg.lift_weight * (lift - objective_cfg.target_lift).square()
                 + objective_cfg.drag_weight * drag_magnitude)
-    return loss, lift / drag_magnitude
+    violation = torch.relu(
+        torch.as_tensor(objective_cfg.minimum_lift, dtype=lift.dtype, device=lift.device) - lift)
+    objective = base + objective_cfg.lift_constraint_weight * violation
+    return objective, lift / drag_magnitude, violation

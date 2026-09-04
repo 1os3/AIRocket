@@ -50,6 +50,13 @@ def check_lbm_evaluation_result(result: dict, cfg) -> None:
     assert bool(torch.isfinite(objective_values).all()), "优化结果 objective 含 NaN/Inf"
     assert (objective["lift_weight"] > 0.0 and objective["drag_weight"] > 0.0
             and objective["drag_epsilon"] > 0.0), "优化结果 objective 权重/稳定项必须 > 0"
+    # 兼容旧结果文件；若新字段存在，则其正升力门槛与引导权重必须有效。
+    if "minimum_lift" in objective:
+        assert objective["minimum_lift"] > 0.0, (
+            "优化结果 objective.minimum_lift 必须 > 0")
+    if "lift_constraint_weight" in objective:
+        assert objective["lift_constraint_weight"] > 0.0, (
+            "优化结果 objective.lift_constraint_weight 必须 > 0")
 
 
 def check_lbm_solver_output(out: dict, count: int, cfg) -> None:

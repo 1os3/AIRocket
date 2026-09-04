@@ -5,6 +5,7 @@
       data.collector, data.lbm_solver, data.sampler, vis.optimization_lbm.checks
 读取配置: seed, device, grid.*, airfoil.*, sampler.tau_min, solver.*,
           optimization.output_dir, optimization.surface_offset_cells,
+          optimization.objective.*,
           vis.out_dir, vis.cmap, vis.dpi, vis.fields
 对外接口:
     - render_optimization_lbm_evaluation(cfg, result_path=None) -> dict
@@ -13,7 +14,7 @@
 
 import json
 import math
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -57,6 +58,11 @@ def _plans(result: dict, cfg) -> tuple:
     return plans, evaluation_cfg
 
 
+def _objective_values(result: dict, cfg) -> dict:
+    # 旧版结果没有正升力字段；当前配置只负责补缺，不覆盖结果中已有的目标定义。
+    return {**asdict(cfg.optimization.objective), **result["objective"]}
+
+
 def _case_metrics(out: dict, index: int, plan, lattice: dict,
                   result: dict, cfg) -> dict:
     metrics = {
@@ -79,13 +85,17 @@ def _case_metrics(out: dict, index: int, plan, lattice: dict,
     coefficients = compute_force_coefficients(
         fields, polygon, cfg, lattice["u_lb"], lattice["reynolds_lattice"],
         surface_offset)
-    objective_cfg = SimpleNamespace(**result["objective"])
-    objective, ratio = compute_optimization_objective(coefficients, objective_cfg)
+    objective_cfg = SimpleNamespace(**_objective_values(result, cfg))
+    objective, ratio, violation = compute_optimization_objective(
+        coefficients, objective_cfg)
     metrics.update({
         "lift": float(coefficients["lift"]),
         "drag": float(coefficients["drag"]),
         "lift_to_drag": float(ratio),
         "objective": float(objective),
+        "lift_violation": float(violation),
+        "positive_lift_feasible": bool(
+            coefficients["lift"] >= objective_cfg.minimum_lift),
     })
     return metrics
 
@@ -108,7 +118,8 @@ def _limits(arrays: list[np.ndarray]) -> tuple[float, float]:
 def _metric_title(label: str, metrics: dict) -> str:
     if not metrics["converged"]:
         return f"{label} · 未收敛 · steps={metrics['total_steps']}"
-    return (f"{label} · Cl={metrics['lift']:.5f} · Cd={metrics['drag']:.5f} · "
+    feasible = "Cl feasible" if metrics["positive_lift_feasible"] else "Cl infeasible"
+    return (f"{label} · {feasible} · Cl={metrics['lift']:.5f} · Cd={metrics['drag']:.5f} · "
             f"L/D={metrics['lift_to_drag']:.5f} · steps={metrics['total_steps']}")
 
 
@@ -173,16 +184,19 @@ def render_optimization_lbm_evaluation(cfg, result_path=None) -> dict:
         for index, label in enumerate(("initial", "optimized"))
     }
     both_converged = all(metrics["converged"] for metrics in case_metrics.values())
-    improved = (both_converged
+    positive_lift = (both_converged
+                     and case_metrics["optimized"]["positive_lift_feasible"])
+    improved = (positive_lift
                 and case_metrics["optimized"]["objective"]
                 < case_metrics["initial"]["objective"])
     report = {
         "source_result": str(path.resolve()),
-        "objective": result["objective"],
+        "objective": _objective_values(result, cfg),
         "surface_offset_cells": result.get(
             "surface_offset_cells", cfg.optimization.surface_offset_cells),
         **case_metrics,
         "both_converged": both_converged,
+        "lbm_positive_lift_feasible": positive_lift,
         "lbm_objective_improved": improved,
         "objective_delta": (case_metrics["optimized"]["objective"]
                             - case_metrics["initial"]["objective"])
@@ -193,7 +207,14 @@ def render_optimization_lbm_evaluation(cfg, result_path=None) -> dict:
     fields = _save_fields(out, output)
     with open(output / "lbm_report.json", "w", encoding="utf-8") as file:
         json.dump(report, file, ensure_ascii=False, indent=2)
-    verdict = "LBM 目标改善" if improved else "LBM 未确认改善"
+    if not both_converged:
+        verdict = "LBM 未全部收敛，结果无效"
+    elif not positive_lift:
+        verdict = "LBM 优化翼型未达到正升力门槛，结果无效"
+    elif improved:
+        verdict = "LBM 正升力有效且目标改善"
+    else:
+        verdict = "LBM 正升力有效，但未确认目标改善"
     print(f"[optimization-lbm] {verdict}；收敛={both_converged}；"
           f"报告={output / 'lbm_report.json'}；图={image}；场={fields}")
     return report

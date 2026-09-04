@@ -330,6 +330,8 @@ class OptimizationFlow:
 class OptimizationObjective:
     mode: str
     target_lift: float
+    minimum_lift: float
+    lift_constraint_weight: float
     lift_weight: float
     drag_weight: float
     drag_epsilon: float
@@ -339,8 +341,12 @@ class OptimizationObjective:
         allowed = {"maximize_lift", "minimize_drag", "maximize_lift_to_drag",
                    "target_lift_min_drag"}
         assert self.mode in allowed, f"optimization.objective.mode 仅支持 {sorted(allowed)}"
-        assert self.lift_weight > 0.0 and self.drag_weight > 0.0, (
-            "optimization.objective 的 lift_weight/drag_weight 必须 > 0")
+        assert self.minimum_lift > 0.0, "optimization.objective.minimum_lift 必须 > 0"
+        assert self.target_lift >= self.minimum_lift, (
+            "optimization.objective.target_lift 不得小于 minimum_lift")
+        assert (self.lift_constraint_weight > 0.0 and self.lift_weight > 0.0
+                and self.drag_weight > 0.0), (
+            "optimization.objective 的约束与目标权重必须 > 0")
         assert self.drag_epsilon > 0.0, "optimization.objective.drag_epsilon 必须 > 0"
 
 

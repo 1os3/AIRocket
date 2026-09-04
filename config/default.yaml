@@ -186,7 +186,7 @@ evaluation:
 optimization:
   checkpoint: output/training/best.pt # 已训练模型；须与 training_data 缓存指纹一致
   output_dir: output/optimization
-  steps: 200
+  steps: 4000
   learning_rate: 5.0e-4
   beta1: 0.9
   beta2: 0.999
@@ -216,6 +216,8 @@ optimization:
       initial: 0.12
       fixed: false
   objective:
+    # 所有模式共同满足 Cl >= minimum_lift；负升力只视为不可行，不能算优化成功。
+    # 违约时统一加 lift_constraint_weight*relu(minimum_lift-Cl)，持续把 Cl 推向正值。
     # maximize_lift：最小化 -Cl，适合只追求更大升力。
     # minimize_drag：最小化 Cd 的平滑绝对值，避免模型给出负阻力时反向钻空子。
     # maximize_lift_to_drag：最小化 -Cl/sqrt(Cd²+drag_epsilon²)，用于提高气动效率。
@@ -223,6 +225,8 @@ optimization:
     #                       + drag_weight*sqrt(Cd²+drag_epsilon²)，用于满足升力约束后减阻。
     mode: maximize_lift_to_drag
     target_lift: 0.5            # 仅 target_lift_min_drag 使用
+    minimum_lift: 0.01          # 所有模式的正升力硬判定门槛，必须 > 0
+    lift_constraint_weight: 10.0 # 所有模式共用的正升力违约引导权重
     lift_weight: 1.0            # 仅 target_lift_min_drag 使用
     drag_weight: 0.1            # 仅 target_lift_min_drag 使用
     drag_epsilon: 1.0e-3        # 升阻比与阻力绝对值的数值稳定项

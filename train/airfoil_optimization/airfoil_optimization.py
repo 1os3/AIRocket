@@ -145,7 +145,8 @@ def _build_batch(cfg, values: dict, manifest: dict,
         flow.aoa_deg, device)
 
 
-def _write_results(cfg, checkpoint: Path, history: list[dict], best: dict) -> dict:
+def _write_results(cfg, checkpoint: Path, history: list[dict], best: dict,
+                   positive_lift_feasible: bool) -> dict:
     output = Path(cfg.optimization.output_dir)
     output.mkdir(parents=True, exist_ok=True)
     with open(output / "history.csv", "w", newline="", encoding="utf-8-sig") as file:
@@ -163,6 +164,9 @@ def _write_results(cfg, checkpoint: Path, history: list[dict], best: dict) -> di
         "parameters": asdict(cfg.optimization.parameters),
         "surface_offset_cells": cfg.optimization.surface_offset_cells,
         "best": best,
+        "positive_lift_feasible": positive_lift_feasible,
+        "best_selection": ("lowest_objective_with_positive_lift"
+                           if positive_lift_feasible else "highest_lift_infeasible"),
         "iterations": len(history) - 1,
     }
     with open(output / "result.json", "w", encoding="utf-8") as file:
@@ -192,7 +196,7 @@ def optimize_airfoil(cfg, checkpoint: str | Path | None = None) -> dict:
         parameters.parameters(), lr=cfg.optimization.learning_rate,
         betas=(cfg.optimization.beta1, cfg.optimization.beta2),
         eps=cfg.optimization.epsilon)
-    history, best = [], None
+    history, best_feasible, best_infeasible = [], None, None
 
     for step in range(cfg.optimization.steps + 1):
         values = parameters.values(device)
@@ -203,7 +207,7 @@ def optimize_airfoil(cfg, checkpoint: str | Path | None = None) -> dict:
         coefficients = compute_force_coefficients(
             fields, polygon, cfg, cfg.optimization.flow.u_lb,
             cfg.optimization.flow.reynolds, cfg.optimization.surface_offset_cells)
-        loss, ratio = compute_optimization_objective(
+        loss, ratio, violation = compute_optimization_objective(
             coefficients, cfg.optimization.objective)
         check_optimization_state(loss, coefficients, values)
         row = {
@@ -212,15 +216,22 @@ def optimize_airfoil(cfg, checkpoint: str | Path | None = None) -> dict:
             "lift": float(coefficients["lift"].detach()),
             "drag": float(coefficients["drag"].detach()),
             "lift_to_drag": float(ratio.detach()),
+            "lift_violation": float(violation.detach()),
+            "positive_lift_feasible": bool(
+                coefficients["lift"].detach() >= cfg.optimization.objective.minimum_lift),
             **{name: float(value.detach()) for name, value in values.items()},
         }
         history.append(row)
-        if best is None or row["objective"] < best["objective"]:
-            best = dict(row)
+        if row["positive_lift_feasible"]:
+            if best_feasible is None or row["objective"] < best_feasible["objective"]:
+                best_feasible = dict(row)
+        elif best_infeasible is None or row["lift"] > best_infeasible["lift"]:
+            best_infeasible = dict(row)
         if step % cfg.optimization.log_every == 0 or step == cfg.optimization.steps:
             print(f"[optimize] step={step}/{cfg.optimization.steps} "
                   f"objective={row['objective']:.6g} Cl={row['lift']:.6g} "
                   f"Cd={row['drag']:.6g} L/D={row['lift_to_drag']:.6g} "
+                  f"positive_lift={row['positive_lift_feasible']} "
                   f"m={row['naca_m']:.6f} p={row['naca_p']:.6f} t={row['naca_t']:.6f}")
         if step == cfg.optimization.steps:
             break
@@ -231,6 +242,9 @@ def optimize_airfoil(cfg, checkpoint: str | Path | None = None) -> dict:
         optimizer.step()
         parameters.project()
 
-    result = _write_results(cfg, checkpoint_path, history, best)
-    print(f"[optimize] 完成：结果写入 {Path(cfg.optimization.output_dir)}")
+    feasible = best_feasible is not None
+    best = best_feasible if feasible else best_infeasible
+    result = _write_results(cfg, checkpoint_path, history, best, feasible)
+    status = "已找到正升力可行解" if feasible else "未找到正升力可行解，仅保存最高升力候选"
+    print(f"[optimize] {status}；结果写入 {Path(cfg.optimization.output_dir)}")
     return result
