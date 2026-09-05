@@ -136,6 +136,7 @@ model:
   dim: 384
   depth: 12
   heads: 6
+  rope_base: 10000.0       # 二维 RoPE 的频率基数；Y/X 各使用每头一半维度
   ffn_hidden: 1536
   decoder_channels: [192, 96, 48]
   norm_eps: 1.0e-6

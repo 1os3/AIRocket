@@ -193,6 +193,7 @@ class Model:
     dim: int
     depth: int
     heads: int
+    rope_base: float
     ffn_hidden: int
     decoder_channels: list
     norm_eps: float
@@ -201,9 +202,11 @@ class Model:
     def __post_init__(self):
         # 校验对象: model.* —— 注意力、SwiGLU 与三级像素洗牌的维度必须可整除
         assert self.input_channels > 0 and self.output_channels > 0, "模型通道数必须 > 0"
-        assert self.patch_size > 0 and self.dim > 0 and self.depth > 0, "模型尺寸必须 > 0"
+        assert self.patch_size > 0 and self.dim > 0 and self.depth > 0 and self.heads > 0, (
+            "模型尺寸与注意力头数必须 > 0")
         assert self.dim % self.heads == 0, "model.dim 必须能被 heads 整除"
-        assert self.dim % 4 == 0, "二维正余弦位置编码要求 model.dim 能被 4 整除"
+        assert (self.dim // self.heads) % 4 == 0, "二维 RoPE 要求每头维度能被 4 整除"
+        assert self.rope_base > 0.0, "model.rope_base 必须 > 0"
         assert self.ffn_hidden % 2 == 0, "SwiGLU 要求 ffn_hidden 为偶数"
         assert len(self.decoder_channels) == 3 and all(x > 0 for x in self.decoder_channels), (
             "decoder_channels 必须是三个正整数")

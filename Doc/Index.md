@@ -54,7 +54,7 @@
 
 - `model/__init__.py` — 模型包声明，公开流场残差 Transformer
 - `model/flow_transformer/__init__.py` — 流场残差 Transformer 模块重导出
-- `model/flow_transformer/flow_transformer.py` — 12 层静态注意力残差 Transformer 与三级 FP32 PixelShuffle 解码器
+- `model/flow_transformer/flow_transformer.py` — 带二维旋转位置编码的 12 层静态注意力残差 Transformer 与三级 FP32 解码器
 - `model/flow_transformer/checks/flow_transformer_checks.py` — 流场残差 Transformer 输入校验
 
 ## train

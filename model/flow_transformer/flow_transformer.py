@@ -1,4 +1,4 @@
-"""12 层静态注意力残差 Transformer 与三级 FP32 PixelShuffle 解码器
+"""带二维旋转位置编码的 12 层静态注意力残差 Transformer 与三级 FP32 解码器
 
 模块: model/flow_transformer/flow_transformer.py
 依赖: torch, model.flow_transformer.checks
@@ -7,7 +7,7 @@
     - RMSNorm: 最后一维均方根归一化
     - RMSNorm2d: 图像通道维均方根归一化
     - FlowResidualTransformer: 输入面元基线场并预测 ux/uy/p 归一化残差
-说明: 嵌入与完整解码器固定 FP32；Transformer 主干服从外层 autocast。
+说明: 嵌入、二维 RoPE 旋转与完整解码器固定 FP32；Transformer 主干服从外层 autocast。
       静态 AttnRes 保存各子层原始增量，绝不执行普通残差加回。
 """
 
@@ -50,19 +50,32 @@ class RMSNorm2d(nn.Module):
         return (normalized * self.weight.float().view(1, -1, 1, 1)).to(dtype)
 
 
-def _sincos_1d(length: int, dim: int) -> torch.Tensor:
-    positions = torch.arange(length, dtype=torch.float32).unsqueeze(1)
-    frequencies = torch.exp(torch.arange(0, dim, 2, dtype=torch.float32)
-                            * (-math.log(10000.0) / dim))
-    angles = positions * frequencies.unsqueeze(0)
-    return torch.cat([angles.sin(), angles.cos()], dim=1)
+class _RoPE2D(nn.Module):
+    def __init__(self, height: int, width: int, head_dim: int, base: float):
+        super().__init__()
+        axis_dim = head_dim // 2
+        frequencies = torch.exp(torch.arange(0, axis_dim, 2, dtype=torch.float32)
+                                * (-math.log(base) / axis_dim))
+        y, x = torch.meshgrid(torch.arange(height, dtype=torch.float32),
+                              torch.arange(width, dtype=torch.float32), indexing="ij")
+        for axis, positions in (("y", y), ("x", x)):
+            angles = positions.reshape(-1, 1) * frequencies
+            self.register_buffer(f"cos_{axis}", angles.cos()[None, None], persistent=False)
+            self.register_buffer(f"sin_{axis}", angles.sin()[None, None], persistent=False)
 
+    @staticmethod
+    def _rotate_axis(values: torch.Tensor, cosine: torch.Tensor,
+                     sine: torch.Tensor) -> torch.Tensor:
+        dtype = values.dtype
+        real, imaginary = values.float().reshape(*values.shape[:-1], -1, 2).unbind(dim=-1)
+        rotated = torch.stack((real * cosine - imaginary * sine,
+                               imaginary * cosine + real * sine), dim=-1)
+        return rotated.flatten(-2).to(dtype)
 
-def _sincos_2d(height: int, width: int, dim: int) -> torch.Tensor:
-    """构造固定二维绝对位置编码，避免增加与 64k 数据规模不相称的自由参数。"""
-    y = _sincos_1d(height, dim // 2)[:, None, :].expand(height, width, -1)
-    x = _sincos_1d(width, dim // 2)[None, :, :].expand(height, width, -1)
-    return torch.cat([y, x], dim=-1).reshape(1, height * width, dim)
+    def forward(self, values: torch.Tensor) -> torch.Tensor:
+        y, x = values.chunk(2, dim=-1)
+        return torch.cat((self._rotate_axis(y, self.cos_y, self.sin_y),
+                          self._rotate_axis(x, self.cos_x, self.sin_x)), dim=-1)
 
 
 class _SpatialAttention(nn.Module):
@@ -74,11 +87,12 @@ class _SpatialAttention(nn.Module):
         self.qkv = nn.Linear(dim, 3 * dim)
         self.proj = nn.Linear(dim, dim)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, rope: _RoPE2D) -> torch.Tensor:
         batch, tokens, dim = x.shape
         qkv = self.qkv(x).reshape(batch, tokens, 3, self.heads, self.head_dim)
         q, k, v = qkv.unbind(dim=2)
         q, k, v = (item.transpose(1, 2) for item in (q, k, v))
+        q, k = rope(q), rope(k)
         out = F.scaled_dot_product_attention(
             q, k, v, dropout_p=self.dropout if self.training else 0.0, is_causal=False)
         return self.proj(out.transpose(1, 2).reshape(batch, tokens, dim))
@@ -154,7 +168,7 @@ class FlowResidualTransformer(nn.Module):
         token_h, token_w = g.ny // m.patch_size, g.nx // m.patch_size
         self.patch_embed = nn.Conv2d(m.input_channels, m.dim, m.patch_size, stride=m.patch_size)
         self.condition_embed = nn.Linear(3, m.dim)
-        self.register_buffer("position", _sincos_2d(token_h, token_w, m.dim), persistent=False)
+        self.rope = _RoPE2D(token_h, token_w, m.dim // m.heads, m.rope_base)
         self.blocks = nn.ModuleList([_TransformerBlock(cfg) for _ in range(m.depth)])
         routes = 2 * m.depth + 1
         self.routing_logits = nn.Parameter(torch.zeros(routes * (routes + 1) // 2))
@@ -179,7 +193,7 @@ class FlowResidualTransformer(nn.Module):
         device_type = fields.device.type
         with torch.autocast(device_type=device_type, enabled=False):
             embedded = self.patch_embed(fields.float()).flatten(2).transpose(1, 2)
-            return embedded + self.condition_embed(conditions.float()).unsqueeze(1) + self.position.float()
+            return embedded + self.condition_embed(conditions.float()).unsqueeze(1)
 
     def _decoder(self, tokens: torch.Tensor) -> torch.Tensor:
         device_type = tokens.device.type
@@ -203,7 +217,7 @@ class FlowResidualTransformer(nn.Module):
         row = 0
         for block in self.blocks:
             attn_input = self._mix(values, row)
-            values.append(block.attn(block.attn_norm(attn_input)))
+            values.append(block.attn(block.attn_norm(attn_input), self.rope))
             row += 1
             ffn_input = self._mix(values, row)
             values.append(block.ffn(block.ffn_norm(ffn_input)))
