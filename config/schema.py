@@ -5,7 +5,7 @@
 读取配置: 全部（本文件定义其类型与约束）
 对外接口:
     - Grid / Solver / Airfoil / Sampler / Storage / Vis: 数据生成配置 dataclass
-    - TrainingData / Model / Training / Loss / Evaluation: 模型训练配置 dataclass
+    - TrainingData / Model / MultiscaleBypass / Training / Loss / Evaluation: 模型训练配置 dataclass
     - Optimization*: NACA 翼型参数端到端优化配置 dataclass
     - Config / config_from_dict(raw): 完整配置及构造入口
     - config_from_dict(raw: dict) -> Config
@@ -186,6 +186,26 @@ class TrainingData:
 
 
 @dataclass(frozen=True)
+class MultiscaleBypass:
+    enabled: bool
+    dim: int
+    depth: int
+    patch_sizes: list
+    roi_chord: list
+
+    def __post_init__(self):
+        # 校验对象: model.multiscale_bypass.* —— 双分辨率旁路及弦长坐标 ROI 必须完整
+        assert isinstance(self.enabled, bool), "model.multiscale_bypass.enabled 必须为布尔值"
+        assert self.dim > 0 and self.depth > 0, "旁路维度与深度必须 > 0"
+        assert len(self.patch_sizes) == 2 \
+            and all(isinstance(x, int) and x > 0 for x in self.patch_sizes), (
+            "model.multiscale_bypass.patch_sizes 必须包含两个正整数")
+        assert len(self.roi_chord) == 4, "model.multiscale_bypass.roi_chord 必须为 [x0,x1,y0,y1]"
+        x0, x1, y0, y1 = self.roi_chord
+        assert x0 < x1 and y0 < y1, "model.multiscale_bypass.roi_chord 边界顺序非法"
+
+
+@dataclass(frozen=True)
 class Model:
     input_channels: int
     output_channels: int
@@ -194,10 +214,12 @@ class Model:
     depth: int
     heads: int
     rope_base: float
+    rope_coordinate_mode: str
     ffn_hidden: int
     decoder_channels: list
     norm_eps: float
     dropout: float
+    multiscale_bypass: MultiscaleBypass
 
     def __post_init__(self):
         # 校验对象: model.* —— 注意力、SwiGLU 与三级像素洗牌的维度必须可整除
@@ -207,6 +229,8 @@ class Model:
         assert self.dim % self.heads == 0, "model.dim 必须能被 heads 整除"
         assert (self.dim // self.heads) % 4 == 0, "二维 RoPE 要求每头维度能被 4 整除"
         assert self.rope_base > 0.0, "model.rope_base 必须 > 0"
+        assert self.rope_coordinate_mode in ("index", "normalized_center"), (
+            "model.rope_coordinate_mode 仅支持 index|normalized_center")
         assert self.ffn_hidden % 2 == 0, "SwiGLU 要求 ffn_hidden 为偶数"
         assert len(self.decoder_channels) == 3 and all(x > 0 for x in self.decoder_channels), (
             "decoder_channels 必须是三个正整数")
@@ -405,6 +429,27 @@ class Config:
     evaluation: Evaluation
     optimization: Optimization
 
+    def __post_init__(self):
+        bypass = self.model.multiscale_bypass
+        if not bypass.enabled:
+            return
+        expected = [self.model.patch_size // 2, self.model.patch_size // 4]
+        # 校验对象: model.multiscale_bypass.patch_sizes —— 分别对齐解码器 /4 与 /2 层级
+        assert self.model.patch_size % 4 == 0 and bypass.patch_sizes == expected, (
+            f"旁路 patch_sizes 必须为骨干 patch_size 的 [1/2,1/4]，期望 {expected}")
+        x0, x1, y0, y1 = bypass.roi_chord
+        pixels = (
+            round(self.grid.x_le + x0 * self.grid.chord),
+            round(self.grid.x_le + x1 * self.grid.chord),
+            round(self.grid.y_center + y0 * self.grid.chord),
+            round(self.grid.y_center + y1 * self.grid.chord),
+        )
+        # 校验对象: model.multiscale_bypass.roi_chord —— ROI 须位于域内并与全部 Patch 对齐
+        assert 0 <= pixels[0] < pixels[1] <= self.grid.nx \
+            and 0 <= pixels[2] < pixels[3] <= self.grid.ny, "多分辨率旁路 ROI 超出计算域"
+        assert all(value % self.model.patch_size == 0 for value in pixels), (
+            "多分辨率旁路 ROI 边界必须与骨干 Patch 对齐")
+
 
 def config_from_dict(raw: dict) -> Config:
     """把 yaml 原始 dict 构造成带校验的 Config 对象。
@@ -421,6 +466,7 @@ def config_from_dict(raw: dict) -> Config:
     assert not extra, f"配置存在未知顶层键: {extra}"
     assert raw["device"] in ("auto", "cpu", "cuda"), "device 仅支持 auto|cpu|cuda"
     optimization = raw["optimization"]
+    model = raw["model"]
     parameters = optimization["parameters"]
     return Config(
         seed=int(raw["seed"]),
@@ -433,7 +479,10 @@ def config_from_dict(raw: dict) -> Config:
         storage=Storage(**raw["storage"]),
         vis=Vis(**raw["vis"]),
         training_data=TrainingData(**raw["training_data"]),
-        model=Model(**raw["model"]),
+        model=Model(
+            **{key: value for key, value in model.items() if key != "multiscale_bypass"},
+            multiscale_bypass=MultiscaleBypass(**model["multiscale_bypass"]),
+        ),
         training=Training(**raw["training"]),
         loss=Loss(**raw["loss"]),
         evaluation=Evaluation(**raw["evaluation"]),

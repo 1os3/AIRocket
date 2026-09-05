@@ -136,11 +136,18 @@ model:
   dim: 384
   depth: 12
   heads: 6
-  rope_base: 10000.0       # 二维 RoPE 的频率基数；Y/X 各使用每头一半维度
+  rope_base: 100.0         # 标准化 Patch 中心坐标的二维 RoPE 频率基数
+  rope_coordinate_mode: normalized_center # Patch 中心按全域映射到 [-1,1]；index 保留旧坐标消融
   ffn_hidden: 1536
   decoder_channels: [192, 96, 48]
   norm_eps: 1.0e-6
   dropout: 0.0
+  multiscale_bypass:
+    enabled: true
+    dim: 128
+    depth: 4
+    patch_sizes: [4, 2]   # 分别在解码器 /4、/2 层级融合
+    roi_chord: [-0.25, 1.50, -0.375, 0.50] # 当前网格对应 x=[48,160), y=[40,96)
 
 # ----------------------------------------------------------------------------
 # 单卡训练；正式训练使用自动混合精度，CPU 冒烟始终为 FP32

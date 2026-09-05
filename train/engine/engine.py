@@ -1,7 +1,8 @@
 """单卡训练、微调、评估、断点恢复与 CPU 最小过拟合验收
 
 模块: train/engine/engine.py
-依赖: torch, matplotlib, data.training_cache, model, train.fine_tuning, train.losses
+依赖: torch, matplotlib, data.training_cache, model, train.engine.checks, train.fine_tuning,
+      train.losses
 读取配置: device, training.*, evaluation.*, loss.*, vis.cmap, vis.dpi
 对外接口:
     - train_model(cfg, checkpoint=None, pretrained_checkpoint=None) -> dict
@@ -22,7 +23,17 @@ from torch.utils.data import DataLoader
 
 from data.training_cache import TrainingFlowDataset, prepare_training_cache
 from model import FlowResidualTransformer
-from train.engine.checks import check_dataset, check_training_initialization
+from train.engine.checks import (
+    check_checkpoint_fingerprint,
+    check_dataset,
+    check_restored_prediction,
+    check_smoke_device,
+    check_smoke_forward,
+    check_smoke_gradients,
+    check_smoke_improvement,
+    check_smoke_model,
+    check_training_initialization,
+)
 from train.fine_tuning import load_pretrained_weights
 from train.losses import compute_flow_losses, reconstruct_fields
 
@@ -159,8 +170,7 @@ def _atomic_save(payload: dict, path: Path) -> None:
 def _load_checkpoint(path: str | Path, model, optimizer=None, scheduler=None, scaler=None,
                      expected_fingerprint: str | None = None) -> dict:
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
-    if expected_fingerprint is not None:
-        assert checkpoint["cache_fingerprint"] == expected_fingerprint, "checkpoint 与训练缓存不匹配"
+    check_checkpoint_fingerprint(checkpoint, expected_fingerprint)
     model.load_state_dict(checkpoint["model"])
     if optimizer is not None:
         optimizer.load_state_dict(checkpoint["optimizer"])
@@ -394,18 +404,13 @@ def evaluate_model(cfg, checkpoint: str | None = None) -> dict:
 
 def smoke_test(cfg) -> dict:
     """CPU FP32 完整模型单样本前后向、20 步过拟合和 checkpoint 往返。"""
-    assert _device(cfg).type == "cpu", "smoke 模式必须使用 CPU"
+    check_smoke_device(_device(cfg))
     prepare_training_cache(cfg)
     dataset = TrainingFlowDataset(cfg, "all")
     check_dataset(dataset, "all")
     batch = _move_batch(next(iter(DataLoader(dataset, batch_size=1, shuffle=False))), torch.device("cpu"))
     model = FlowResidualTransformer(cfg).float()
-    routes = 2 * cfg.model.depth + 1
-    assert model.routing_logits.numel() == routes * (routes + 1) // 2, "AttnRes 参数数目错误"
-    weights = model.routing_weights()
-    assert torch.allclose(weights.sum(1), torch.ones(routes), atol=2.0e-7), "AttnRes 行权重和不为 1"
-    forbidden = (torch.nn.LayerNorm, torch.nn.modules.batchnorm._BatchNorm, torch.nn.GroupNorm)
-    assert not any(isinstance(module, forbidden) for module in model.modules()), "模型含非 RMSNorm"
+    check_smoke_model(model, cfg)
     optimizer = _optimizer(model, cfg)
     initial, best = None, float("inf")
     steps = cfg.training.max_steps or 20
@@ -413,17 +418,11 @@ def smoke_test(cfg) -> dict:
     for step in range(steps):
         optimizer.zero_grad(set_to_none=True)
         prediction = model(batch["inputs"], batch["conditions"])
-        assert prediction.dtype == torch.float32, "CPU 冒烟输出必须为 FP32"
         losses = compute_flow_losses(prediction, batch, cfg, step / max(steps - 1, 1))
-        assert all(torch.isfinite(value) for value in losses.values()), "冒烟损失出现 NaN/Inf"
+        check_smoke_forward(prediction, losses)
         losses["total"].backward()
         if step >= 1:
-            pixel_grads = [stage.shuffle_conv.weight.grad for stage in model.decoder]
-            assert all(grad is not None and torch.isfinite(grad).all() and bool(grad.abs().sum() > 0)
-                       for grad in pixel_grads), "三级 PixelShuffle 未全部获得有效梯度"
-            route_grad = model.routing_logits.grad
-            assert route_grad is not None and torch.isfinite(route_grad).all() \
-                and bool(route_grad.abs().sum() > 0), "静态 AttnRes 未获得有效梯度"
+            check_smoke_gradients(model, cfg)
         torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.training.grad_clip)
         optimizer.step()
         data_value = float(losses["data"].detach())
@@ -435,9 +434,7 @@ def smoke_test(cfg) -> dict:
         threshold = 1.0 - cfg.training.smoke_min_improvement
         if completed_steps >= 2 and best <= initial * threshold:
             break
-    assert best <= initial * threshold, (
-        f"单样本过拟合未达到 {cfg.training.smoke_min_improvement:.1%}："
-        f"initial={initial} best={best}")
+    check_smoke_improvement(initial, best, cfg.training.smoke_min_improvement)
     with torch.no_grad():
         prediction = model(batch["inputs"], batch["conditions"])
     output = Path(cfg.training.output_dir)
@@ -449,8 +446,7 @@ def smoke_test(cfg) -> dict:
                      expected_fingerprint=dataset.manifest["fingerprint"])
     with torch.no_grad():
         restored_prediction = restored(batch["inputs"], batch["conditions"])
-    assert torch.allclose(prediction, restored_prediction, rtol=1.0e-5, atol=1.0e-6), (
-        "checkpoint 往返后模型输出不一致")
+    check_restored_prediction(prediction, restored_prediction)
     visual = (restored_prediction, batch)
     _render_visual(visual, output / "visuals", cfg.evaluation.num_visualizations,
                    cfg.vis.cmap, cfg.vis.dpi)
